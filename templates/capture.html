@@ -1,0 +1,356 @@
+{% extends "base.html" %} {% block title %}Add User - Capture Dataset{% endblock
+%} {% block content %}
+<div class="page-container">
+  <div class="back-button-container">
+    <a href="/" class="btn-back">← Back to Recognition</a>
+  </div>
+
+  <div class="capture-layout">
+    <div class="capture-video-section">
+      <h2>📸 Capture Face Dataset</h2>
+      <p class="subtitle">
+        Uses server camera - Captures 50 images automatically
+      </p>
+
+      <div class="capture-video-container" style="position: relative">
+        <!--
+          Canvas replaces <img src="/video_feed"> for the capture page.
+          The JS below reads /raw_video_feed (no detection overlay, no YOLO cost)
+          and blits each MJPEG frame onto the canvas via createImageBitmap().
+          This path avoids:
+            - HTTP multipart parse overhead of <img> MJPEG
+            - Browser layout recalc on every src= change
+            - The 10 ms sleep that was throttling generate_frames()
+          Result: smooth ~55-60 fps preview instead of 10-20 fps.
+        -->
+        <canvas
+          id="serverFeed"
+          style="width: 100%; display: block; background: #000"
+          width="640"
+          height="480"
+        ></canvas>
+
+        <div
+          class="capture-overlay"
+          style="position: absolute; top: 8px; right: 8px"
+        >
+          <div class="capture-count" id="captureCount">0 / 50</div>
+          <div class="capture-status" id="captureStatus">Ready</div>
+        </div>
+      </div>
+
+      <div class="preview-grid" id="previewGrid"></div>
+    </div>
+
+    <div class="capture-controls-section">
+      <div class="control-card">
+        <h3>👤 Person Information</h3>
+        <div class="form-group">
+          <label>Person Name:</label>
+          <input
+            type="text"
+            id="personName"
+            placeholder="User1, Alice, Bob..."
+            class="input-field"
+            autocomplete="off"
+          />
+          <p class="help-text">
+            Must match exactly when recognizing (case-sensitive)
+          </p>
+        </div>
+      </div>
+
+      <div class="control-card">
+        <h3>🎬 Capture Controls</h3>
+        <button id="startBtn" class="btn-large btn-primary" disabled>
+          ▶ Start Capture (50 images)
+        </button>
+        <button id="stopBtn" class="btn-large btn-danger" style="display: none">
+          ⏹ Stop Early
+        </button>
+        <button
+          id="resetBtn"
+          class="btn-large btn-secondary"
+          style="display: none"
+        >
+          🔄 Start Over
+        </button>
+      </div>
+
+      <div class="control-card">
+        <h3>📋 Instructions</h3>
+        <ol class="instructions-list">
+          <li>Enter person's name above</li>
+          <li>Click "Start Capture"</li>
+          <li>Look at camera feed on left</li>
+          <li>
+            <strong>Move your head slowly:</strong>
+            <ul>
+              <li>Turn left, then right</li>
+              <li>Tilt up, then down</li>
+              <li>Different expressions</li>
+            </ul>
+          </li>
+          <li>System captures 50 images (every 400ms)</li>
+          <li>Auto-stops when complete</li>
+        </ol>
+      </div>
+
+      <div class="control-card">
+        <h3>💡 Tips</h3>
+        <div class="tips-compact">
+          <div class="tip-item">
+            💡 <strong>Lighting:</strong> Good, even lighting
+          </div>
+          <div class="tip-item">
+            📐 <strong>Angles:</strong> Turn head slowly
+          </div>
+          <div class="tip-item">
+            😊 <strong>Expressions:</strong> Vary your face
+          </div>
+          <div class="tip-item">
+            👓 <strong>Accessories:</strong> With/without glasses
+          </div>
+        </div>
+      </div>
+
+      <div class="control-card">
+        <h3>✅ After Capture</h3>
+        <ol class="next-steps-list">
+          <li>Click "🧠 Generate Embeddings" in navbar</li>
+          <li>Wait for processing to complete</li>
+          <li>Return to home page</li>
+          <li>Enter command and start recognition!</li>
+        </ol>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %} {% block extra_js %}
+<script>
+  // ── High-fps canvas stream pump ──────────────────────────────────────────
+  // Reads /raw_video_feed (MJPEG, no detection overhead) and blits each frame
+  // onto the canvas using createImageBitmap() — fully off the main thread.
+  // This gives ~55-60 fps instead of 10-20 fps from a plain <img> MJPEG tag.
+  (function startCanvasFeed() {
+    const canvas = document.getElementById("serverFeed");
+    const ctx = canvas.getContext("2d");
+    let active = true;
+
+    async function pump() {
+      let response;
+      try {
+        response = await fetch("/raw_video_feed");
+      } catch (e) {
+        // Server not yet ready — retry after 500 ms
+        setTimeout(pump, 500);
+        return;
+      }
+
+      const reader = response.body.getReader();
+      let buf = new Uint8Array(0);
+      const SOI = 0xff,
+        SOI2 = 0xd8; // JPEG start-of-image marker bytes
+      const EOI1 = 0xff,
+        EOI2 = 0xd9; // JPEG end-of-image marker bytes
+
+      async function readLoop() {
+        while (active) {
+          let chunk;
+          try {
+            const result = await reader.read();
+            if (result.done) break;
+            chunk = result.value;
+          } catch (e) {
+            break;
+          }
+
+          // Append new bytes to buffer
+          const merged = new Uint8Array(buf.length + chunk.length);
+          merged.set(buf);
+          merged.set(chunk, buf.length);
+          buf = merged;
+
+          // Extract complete JPEG frames (FF D8 ... FF D9)
+          let start = -1;
+          for (let i = 0; i < buf.length - 1; i++) {
+            if (buf[i] === SOI && buf[i + 1] === SOI2) {
+              start = i;
+            }
+            if (start >= 0 && buf[i] === EOI1 && buf[i + 1] === EOI2) {
+              const jpegBytes = buf.slice(start, i + 2);
+              buf = buf.slice(i + 2); // discard consumed bytes
+              start = -1;
+
+              // Decode + blit off-main-thread via createImageBitmap
+              try {
+                const blob = new Blob([jpegBytes], { type: "image/jpeg" });
+                const bitmap = await createImageBitmap(blob);
+                // Resize canvas to match incoming frame exactly (once)
+                if (canvas.width !== bitmap.width) canvas.width = bitmap.width;
+                if (canvas.height !== bitmap.height)
+                  canvas.height = bitmap.height;
+                ctx.drawImage(bitmap, 0, 0);
+                bitmap.close(); // release GPU texture immediately
+              } catch (_) {
+                /* skip corrupted frame */
+              }
+
+              i = -1; // restart scan from remaining buffer
+            }
+          }
+        }
+        // Connection dropped — reconnect after 200 ms
+        if (active) setTimeout(pump, 200);
+      }
+
+      readLoop();
+    }
+
+    pump();
+
+    // Pause stream when tab is hidden (saves CPU/bandwidth)
+    document.addEventListener("visibilitychange", () => {
+      active = !document.hidden;
+      if (active) pump();
+    });
+  })();
+
+  // ── Capture logic (unchanged) ─────────────────────────────────────────────
+  let capturing = false;
+  let captureInterval = null;
+  let captureCount = 0;
+  const MAX_CAPTURES = 50;
+  const CAPTURE_DELAY = 400;
+  let personName = "";
+  let capturedImages = [];
+
+  // Enable start button when name entered
+  document.getElementById("personName").addEventListener("input", function () {
+    document.getElementById("startBtn").disabled = !this.value.trim();
+  });
+
+  // Start capture
+  document.getElementById("startBtn").addEventListener("click", function () {
+    personName = document.getElementById("personName").value.trim();
+    if (!personName) return;
+
+    captureCount = 0;
+    capturedImages = [];
+    document.getElementById("previewGrid").innerHTML = "";
+
+    capturing = true;
+    this.style.display = "none";
+    document.getElementById("stopBtn").style.display = "block";
+    document.getElementById("personName").disabled = true;
+    document.getElementById("captureStatus").textContent =
+      "📸 Capturing from server...";
+    document.getElementById("captureStatus").style.color = "#f59e0b";
+
+    captureInterval = setInterval(captureFromServer, CAPTURE_DELAY);
+  });
+
+  document.getElementById("stopBtn").addEventListener("click", stopCapture);
+
+  document.getElementById("resetBtn").addEventListener("click", function () {
+    location.reload();
+  });
+
+  async function captureFromServer() {
+    if (!capturing || captureCount >= MAX_CAPTURES) {
+      if (captureCount >= MAX_CAPTURES) stopCapture();
+      return;
+    }
+
+    try {
+      const response = await fetch("/api/capture_frame", { method: "POST" });
+      const data = await response.json();
+
+      if (data.success && data.image) {
+        const byteCharacters = atob(data.image);
+        const byteNumbers = new Array(byteCharacters.length);
+        for (let i = 0; i < byteCharacters.length; i++) {
+          byteNumbers[i] = byteCharacters.charCodeAt(i);
+        }
+        const blob = new Blob([new Uint8Array(byteNumbers)], {
+          type: "image/jpeg",
+        });
+
+        capturedImages.push(blob);
+        captureCount++;
+        document.getElementById("captureCount").textContent =
+          captureCount + " / " + MAX_CAPTURES;
+
+        const img = document.createElement("img");
+        img.src = URL.createObjectURL(blob);
+        img.className = "preview-thumb";
+        document.getElementById("previewGrid").appendChild(img);
+
+        if (captureCount >= MAX_CAPTURES) stopCapture();
+      }
+    } catch (err) {
+      console.error("Capture error:", err);
+    }
+  }
+
+  async function stopCapture() {
+    capturing = false;
+    clearInterval(captureInterval);
+    document.getElementById("stopBtn").style.display = "none";
+    document.getElementById("captureStatus").textContent = "⏳ Uploading...";
+    document.getElementById("captureStatus").style.color = "#0ea5e9";
+    await uploadImages();
+  }
+
+  async function uploadImages() {
+    const formData = new FormData();
+    formData.append("person_name", personName);
+    capturedImages.forEach(function (blob, index) {
+      formData.append("images", blob, String(index).padStart(4, "0") + ".jpg");
+    });
+
+    try {
+      const response = await fetch("/api/upload_dataset", {
+        method: "POST",
+        body: formData,
+      });
+      const data = await response.json();
+
+      if (data.success) {
+        document.getElementById("captureStatus").textContent =
+          "✓ Saved " + data.count + " images!";
+        document.getElementById("captureStatus").style.color = "#10b981";
+        document.getElementById("resetBtn").style.display = "block";
+        alert(
+          "✓ Success!\n\nCaptured " +
+            data.count +
+            ' images for "' +
+            personName +
+            '"\n\nNext steps:\n1. Click "🧠 Generate Embeddings" in navbar\n2. Wait for processing\n3. Return to home page',
+        );
+      } else {
+        throw new Error(data.message);
+      }
+    } catch (err) {
+      document.getElementById("captureStatus").textContent = "✗ Upload failed";
+      document.getElementById("captureStatus").style.color = "#ef4444";
+      alert("Upload Error: " + err.message);
+      document.getElementById("startBtn").style.display = "block";
+      document.getElementById("startBtn").disabled = false;
+      document.getElementById("personName").disabled = false;
+    }
+  }
+
+  document
+    .getElementById("personName")
+    .addEventListener("keypress", function (e) {
+      if (e.key === "Enter" && !document.getElementById("startBtn").disabled) {
+        document.getElementById("startBtn").click();
+      }
+    });
+
+  document.getElementById("captureStatus").textContent =
+    "✓ Camera ready (using server feed)";
+  document.getElementById("captureStatus").style.color = "#10b981";
+</script>
+{% endblock %}

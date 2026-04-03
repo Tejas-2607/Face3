@@ -1,0 +1,257 @@
+{% extends "base.html" %} {% block title %}Manage Dataset - Face Recognition
+System{% endblock %} {% block content %}
+<div class="page-container">
+  <!-- Back Button -->
+  <div class="back-button-container">
+    <a href="/" class="btn-back">← Back to Recognition</a>
+  </div>
+
+  <div class="manage-header">
+    <h1>⚙️ Dataset Management</h1>
+    <p class="subtitle">View and manage captured face datasets</p>
+  </div>
+
+  <div class="actions-bar-manage">
+    <button id="refreshBtn" class="btn-action">🔄 Refresh</button>
+    <button id="regenerateBtn" class="btn-action btn-action-primary">
+      🧠 Regenerate Embeddings
+    </button>
+    <button id="deleteEmbeddingsBtn" class="btn-action btn-action-danger">
+      🗑️ Delete Embeddings File
+    </button>
+  </div>
+
+  <div id="statusMessage" class="status-message-manage"></div>
+
+  {% if persons %}
+  <div class="dataset-grid-manage">
+    {% for person in persons %}
+    <div class="person-card-manage" data-person="{{ person.name }}">
+      <div class="person-header-manage">
+        <h3>{{ person.name }}</h3>
+        <span class="image-count-badge">{{ person.count }} images</span>
+      </div>
+      <div class="person-body-manage">
+        <div class="person-icon-large">👤</div>
+        <p class="person-path-text">dataset/{{ person.name }}/</p>
+      </div>
+      <div class="person-actions-manage">
+        <button
+          class="btn-delete-person"
+          onclick="deletePerson('{{ person.name }}')"
+        >
+          🗑️ Delete
+        </button>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty-state-manage">
+    <div class="empty-icon-large">📁</div>
+    <h3>No Datasets Found</h3>
+    <p>Capture face images using the Add User feature to get started.</p>
+    <a href="/capture" class="btn-overlay">➕ Add User Now</a>
+  </div>
+  {% endif %}
+
+  <div class="stats-section-manage">
+    <h3>📊 Dataset Statistics</h3>
+    <div class="stats-grid-manage">
+      <div class="stat-card-manage">
+        <div class="stat-number-large">{{ persons|length }}</div>
+        <div class="stat-label-text">Total Persons</div>
+      </div>
+      <div class="stat-card-manage">
+        <div class="stat-number-large">
+          {% set total = 0 %} {% for person in persons %} {% set total = total +
+          person.count %} {% endfor %} {{ total }}
+        </div>
+        <div class="stat-label-text">Total Images</div>
+      </div>
+      <div class="stat-card-manage">
+        <div class="stat-number-large">
+          {% if persons %} {% set total = 0 %} {% for person in persons %} {%
+          set total = total + person.count %} {% endfor %} {{ (total /
+          persons|length)|round|int }} {% else %} 0 {% endif %}
+        </div>
+        <div class="stat-label-text">Avg Images/Person</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="guidelines-section-manage">
+    <h3>⚙️ Dataset Guidelines</h3>
+    <ul class="guidelines-list-manage">
+      <li>
+        <strong>Minimum Images:</strong> At least 30-50 images per person for
+        reliable recognition
+      </li>
+      <li>
+        <strong>Quality:</strong> Images should be well-lit with clear facial
+        features
+      </li>
+      <li>
+        <strong>Variety:</strong> Include different angles, expressions, and
+        lighting conditions
+      </li>
+      <li>
+        <strong>Naming:</strong> Use consistent naming (e.g., "User1", "John",
+        "Alice")
+      </li>
+      <li>
+        <strong>Regenerate:</strong> Always regenerate embeddings after
+        adding/deleting persons
+      </li>
+    </ul>
+  </div>
+</div>
+{% endblock %} {% block extra_js %}
+<script>
+  // Refresh page
+  document.getElementById("refreshBtn").addEventListener("click", function () {
+    location.reload();
+  });
+
+  // Regenerate embeddings
+  document
+    .getElementById("regenerateBtn")
+    .addEventListener("click", function () {
+      const btn = this;
+      const statusDiv = document.getElementById("statusMessage");
+
+      if (
+        !confirm(
+          "Regenerate embeddings from dataset?\n\nThis will process all images and may take a few moments.",
+        )
+      ) {
+        return;
+      }
+
+      btn.disabled = true;
+      btn.textContent = "⏳ Generating...";
+      statusDiv.textContent = "Processing dataset images...";
+      statusDiv.className = "status-message-manage status-info";
+      statusDiv.style.display = "block";
+
+      fetch("/api/generate_embeddings", {
+        method: "POST",
+      })
+        .then((response) => response.json())
+        .then((data) => {
+          btn.disabled = false;
+          btn.textContent = "🧠 Regenerate Embeddings";
+
+          if (data.success) {
+            statusDiv.textContent = `✓ ${data.message}`;
+            statusDiv.className = "status-message-manage status-success";
+            setTimeout(() => {
+              statusDiv.style.display = "none";
+            }, 5000);
+          } else {
+            statusDiv.textContent = `✗ ${data.message}`;
+            statusDiv.className = "status-message-manage status-error";
+          }
+        })
+        .catch((error) => {
+          btn.disabled = false;
+          btn.textContent = "🧠 Regenerate Embeddings";
+          statusDiv.textContent = "✗ Error generating embeddings";
+          statusDiv.className = "status-message-manage status-error";
+        });
+    });
+
+  // Delete embeddings file
+  document
+    .getElementById("deleteEmbeddingsBtn")
+    .addEventListener("click", function () {
+      const btn = this;
+      const statusDiv = document.getElementById("statusMessage");
+
+      if (
+        !confirm(
+          "⚠️ Delete Embeddings File?\n\nThis will delete face_embeddings.pkl\n\nYou will need to regenerate embeddings to use recognition again.\n\nThis action cannot be undone.",
+        )
+      ) {
+        return;
+      }
+
+      btn.disabled = true;
+      btn.textContent = "⏳ Deleting...";
+      statusDiv.textContent = "Deleting embeddings file...";
+      statusDiv.className = "status-message-manage status-info";
+      statusDiv.style.display = "block";
+
+      fetch("/api/delete_embeddings", {
+        method: "DELETE",
+      })
+        .then((response) => response.json())
+        .then((data) => {
+          btn.disabled = false;
+          btn.textContent = "🗑️ Delete Embeddings File";
+
+          if (data.success) {
+            statusDiv.textContent = "✓ " + data.message;
+            statusDiv.className = "status-message-manage status-success";
+            setTimeout(() => {
+              statusDiv.style.display = "none";
+            }, 3000);
+          } else {
+            statusDiv.textContent = "✗ " + data.message;
+            statusDiv.className = "status-message-manage status-error";
+          }
+        })
+        .catch((error) => {
+          btn.disabled = false;
+          btn.textContent = "🗑️ Delete Embeddings File";
+          statusDiv.textContent = "✗ Error deleting embeddings file";
+          statusDiv.className = "status-message-manage status-error";
+        });
+    });
+
+  // Delete person
+  function deletePerson(personName) {
+    if (
+      !confirm(
+        `Are you sure you want to delete all data for "${personName}"?\n\nThis will delete all captured images. This action cannot be undone.`,
+      )
+    ) {
+      return;
+    }
+
+    const statusDiv = document.getElementById("statusMessage");
+    statusDiv.textContent = `Deleting ${personName}...`;
+    statusDiv.className = "status-message-manage status-info";
+    statusDiv.style.display = "block";
+
+    fetch(`/api/delete_person/${personName}`, {
+      method: "DELETE",
+    })
+      .then((response) => response.json())
+      .then((data) => {
+        if (data.success) {
+          statusDiv.textContent = `✓ ${data.message}`;
+          statusDiv.className = "status-message-manage status-success";
+
+          // Remove card from UI
+          const card = document.querySelector(`[data-person="${personName}"]`);
+          if (card) {
+            card.remove();
+          }
+
+          // Refresh page after 2 seconds
+          setTimeout(() => {
+            location.reload();
+          }, 2000);
+        } else {
+          statusDiv.textContent = `✗ ${data.message}`;
+          statusDiv.className = "status-message-manage status-error";
+        }
+      })
+      .catch((error) => {
+        statusDiv.textContent = "✗ Error deleting person";
+        statusDiv.className = "status-message-manage status-error";
+      });
+  }
+</script>
+{% endblock %}

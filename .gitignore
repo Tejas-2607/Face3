@@ -1,0 +1,15 @@
+/venv
+/dataset
+/embeddings
+/snapshots
+/templates1
+/__pycache__
+/tempfiles
+/weights
+/gcode
+/static/VedaFullLogo.png
+/static/VedaIconLogo.png
+/yolov11n-face.pt
+# /arcface_r100.onnx
+/models/arcface_r100.onnx
+/models/w600k_r50.onnx

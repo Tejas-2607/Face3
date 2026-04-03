@@ -1,0 +1,193 @@
+{% extends "base.html" %} {% block title %}Recognition - Face Recognition
+System{% endblock %} {% block content %}
+<div class="recognition-page">
+  <h1>Face Recognition & Command Execution</h1>
+
+  <div class="command-section">
+    <h3>Command Input</h3>
+    <div class="command-input-group">
+      <input
+        type="text"
+        id="commandInput"
+        placeholder="Enter command (e.g., 'detect person right to User1')"
+        class="command-input"
+      />
+      <button id="executeBtn" class="btn btn-primary">Execute</button>
+      <button id="clearBtn" class="btn btn-secondary">Clear</button>
+    </div>
+    <div id="commandFeedback" class="command-feedback"></div>
+
+    <div class="command-help">
+      <h4>Command Examples:</h4>
+      <ul>
+        <li><code>detect the person right to User1</code></li>
+        <li><code>find second person on left of User1</code></li>
+        <li><code>show me first person left of User1</code></li>
+        <li><code>capture third person right of User1</code></li>
+      </ul>
+      <p>
+        <strong>Format:</strong> [action] [position] person [direction] of
+        [reference_person]
+      </p>
+      <ul class="format-help">
+        <li><strong>Action:</strong> detect, find, show, capture</li>
+        <li>
+          <strong>Position:</strong> first, second, third (default: first)
+        </li>
+        <li><strong>Direction:</strong> left, right</li>
+        <li>
+          <strong>Reference Person:</strong> must match dataset name
+          (case-sensitive)
+        </li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="video-section">
+    <h3>Live Camera Feed</h3>
+    <div class="video-container">
+      <img id="videoFeed" src="{{ url_for('video_feed') }}" alt="Live Feed" />
+    </div>
+
+    <div class="video-controls">
+      <button id="snapshotBtn" class="btn btn-secondary">
+        📷 Capture Snapshot
+      </button>
+      <div id="snapshotStatus" class="status-message"></div>
+    </div>
+  </div>
+
+  <div class="detection-info">
+    <h3>Detection Information</h3>
+    <div id="detectionDetails" class="info-grid">
+      <div class="info-item">
+        <span class="info-label">Total Faces:</span>
+        <span id="totalFaces" class="info-value">-</span>
+      </div>
+      <div class="info-item">
+        <span class="info-label">Current Command:</span>
+        <span id="currentCommand" class="info-value">None</span>
+      </div>
+      <div class="info-item">
+        <span class="info-label">Status:</span>
+        <span id="detectionStatus" class="info-value"
+          >Waiting for command...</span
+        >
+      </div>
+    </div>
+    <div id="facesList" class="faces-list"></div>
+  </div>
+</div>
+{% endblock %} {% block extra_js %}
+<script>
+  let currentCommandData = null;
+
+  // Execute command
+  document.getElementById("executeBtn").addEventListener("click", function () {
+    const command = document.getElementById("commandInput").value.trim();
+    const feedbackDiv = document.getElementById("commandFeedback");
+
+    if (!command) {
+      feedbackDiv.textContent = "Please enter a command";
+      feedbackDiv.className = "command-feedback error";
+      return;
+    }
+
+    fetch("/api/set_command", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ command: command }),
+    })
+      .then((response) => response.json())
+      .then((data) => {
+        if (data.success) {
+          feedbackDiv.textContent = data.message;
+          feedbackDiv.className = "command-feedback success";
+          currentCommandData = data.command;
+          updateCommandDisplay();
+        } else {
+          feedbackDiv.textContent = data.message;
+          feedbackDiv.className = "command-feedback error";
+          currentCommandData = null;
+        }
+      })
+      .catch((error) => {
+        feedbackDiv.textContent = "Error executing command";
+        feedbackDiv.className = "command-feedback error";
+      });
+  });
+
+  // Clear command
+  document.getElementById("clearBtn").addEventListener("click", function () {
+    document.getElementById("commandInput").value = "";
+    document.getElementById("commandFeedback").textContent = "";
+    currentCommandData = null;
+
+    fetch("/api/clear_command", {
+      method: "POST",
+    }).then(() => {
+      document.getElementById("currentCommand").textContent = "None";
+      document.getElementById("detectionStatus").textContent =
+        "Waiting for command...";
+    });
+  });
+
+  // Capture snapshot
+  document.getElementById("snapshotBtn").addEventListener("click", function () {
+    const statusDiv = document.getElementById("snapshotStatus");
+
+    fetch("/api/capture_snapshot", {
+      method: "POST",
+    })
+      .then((response) => response.json())
+      .then((data) => {
+        if (data.success) {
+          statusDiv.textContent = `✓ ${data.message}: ${data.filename}`;
+          statusDiv.className = "status-message success";
+          setTimeout(() => {
+            statusDiv.textContent = "";
+          }, 5000);
+        } else {
+          statusDiv.textContent = `✗ ${data.message}`;
+          statusDiv.className = "status-message error";
+        }
+      })
+      .catch((error) => {
+        statusDiv.textContent = "✗ Error capturing snapshot";
+        statusDiv.className = "status-message error";
+      });
+  });
+
+  // Update command display
+  function updateCommandDisplay() {
+    if (currentCommandData) {
+      const positionText =
+        ["first", "second", "third", "fourth"][
+          currentCommandData.position - 1
+        ] || `${currentCommandData.position}th`;
+      document.getElementById("currentCommand").textContent =
+        `${currentCommandData.action} ${positionText} person ${currentCommandData.direction} of ${currentCommandData.reference_person}`;
+    }
+  }
+
+  // Allow Enter key to execute command
+  document
+    .getElementById("commandInput")
+    .addEventListener("keypress", function (e) {
+      if (e.key === "Enter") {
+        document.getElementById("executeBtn").click();
+      }
+    });
+
+  // Load command from URL parameter (if any)
+  const urlParams = new URLSearchParams(window.location.search);
+  const preloadCommand = urlParams.get("cmd");
+  if (preloadCommand) {
+    document.getElementById("commandInput").value =
+      decodeURIComponent(preloadCommand);
+    setTimeout(() => document.getElementById("executeBtn").click(), 500);
+  }
+</script>
+{% endblock %}
