@@ -20,7 +20,7 @@ import json
 import re
 import urllib.request
 import urllib.error
-
+import random
 # pyttsx3 availability check — engine is NOT created here.
 # On Windows, pyttsx3 uses COM which is thread-bound: an engine created on
 # the main thread silently fails when used from any other thread.
@@ -1373,7 +1373,7 @@ def generate_embeddings_from_dataset():
 
 @app.route('/')
 def index():
-    return render_template('index.html')  # VEDA UI
+    return render_template('index1.html')  # VEDA UI
 
 @app.route('/capture')
 def capture_page():
@@ -1754,6 +1754,175 @@ def reset_snapshot():
     return jsonify({'success': True, 'message': 'Ready for next detection'})
 
 
+@app.route('/api/capture_targeted', methods=['POST'])
+def capture_targeted():
+    """
+    Immediately capture a snapshot of a *specific named person* from the current
+    camera frame.  Called by the frontend right after the "3…2…1…capturing!"
+    countdown so the photo is taken at exactly the right moment, focused only on
+    the named visitor — ignoring everyone else in frame.
+
+    Request body:
+      { "person_name": "Tejas" }   ← name collected at VEDA step 3
+
+    Algorithm
+    ---------
+    1. Read latest raw camera frame.
+    2. Run fresh YOLO detection (SNAPSHOT_DET_SIZE for accuracy).
+    3. For each detected face, compute ArcFace embedding + cosine similarity
+       against stored embeddings — same pipeline as the live detection loop.
+    4. Select target face:
+       a) Best cosine-similarity match for person_name (case-insensitive)
+       b) Partial first-name match as fallback
+       c) Centremost face if no name match (visitor is always centre-frame)
+    5. Full-body crop around target only → save → return as pending snapshot.
+
+    Returns:
+      { success, snapshot: { filename, person_name, position_desc } }
+    """
+    try:
+        data        = request.json or {}
+        person_name = data.get('person_name', '').strip()
+
+        # ── Grab the latest raw frame ────────────────────────────────────────
+        frame, _ = state.raw_slot.read()
+        if frame is None:
+            return jsonify({'success': False, 'message': 'No camera frame available'})
+
+        if state.recognizer is None:
+            return jsonify({'success': False, 'message': 'Recognizer not ready'})
+
+        fh, fw = frame.shape[:2]
+
+        # ── Run YOLO detection at high-accuracy size ─────────────────────────
+        # Scale frame down to SNAPSHOT_DET_SIZE, run .get(), scale bboxes back.
+        scale_x = scale_y = 1.0
+        detect_frame = frame
+        if DETECT_FRAME_SCALE < 1.0:
+            small_w = int(fw * DETECT_FRAME_SCALE)
+            small_h = int(fh * DETECT_FRAME_SCALE)
+            detect_frame = cv2.resize(frame, (small_w, small_h),
+                                      interpolation=cv2.INTER_LINEAR)
+            scale_x = fw / small_w
+            scale_y = fh / small_h
+
+        faces = state.recognizer.get(np.ascontiguousarray(detect_frame))
+
+        if not faces:
+            return jsonify({'success': False, 'message': 'No faces detected in frame'})
+
+        # ── Resolve name → score for every face (same as live loop) ─────────
+        detected = []
+
+        if (state.normalized_embeddings is not None and
+                len(state.normalized_embeddings) > 0):
+            # Batch cosine similarity: all face embeddings in one BLAS call
+            emb_batch = np.array([f["normed_embedding"] for f in faces],
+                                 dtype=np.float32)
+            sims = fast_cosine_batch(emb_batch, state.normalized_embeddings)
+            for i, face in enumerate(faces):
+                best_idx   = int(np.argmax(sims[i]))
+                best_score = float(sims[i, best_idx])
+                name = (state.known_names[best_idx]
+                        if best_score > RECOGNITION_THRESHOLD else "Unknown")
+                raw_bbox = face["bbox"].astype(int)
+                bbox = [
+                    int(raw_bbox[0] * scale_x), int(raw_bbox[1] * scale_y),
+                    int(raw_bbox[2] * scale_x), int(raw_bbox[3] * scale_y),
+                ]
+                cx = (bbox[0] + bbox[2]) // 2
+                cy = (bbox[1] + bbox[3]) // 2
+                detected.append({'name': name, 'score': best_score,
+                                 'bbox': bbox, 'cx': cx, 'cy': cy})
+        else:
+            # No embeddings loaded — build detection list without identity
+            for face in faces:
+                raw_bbox = face["bbox"].astype(int)
+                bbox = [
+                    int(raw_bbox[0] * scale_x), int(raw_bbox[1] * scale_y),
+                    int(raw_bbox[2] * scale_x), int(raw_bbox[3] * scale_y),
+                ]
+                cx = (bbox[0] + bbox[2]) // 2
+                cy = (bbox[1] + bbox[3]) // 2
+                detected.append({'name': 'Unknown', 'score': 0.0,
+                                 'bbox': bbox, 'cx': cx, 'cy': cy})
+
+        # ── Select the target face ───────────────────────────────────────────
+        target = None
+
+        # Priority 1 — exact name match, best score wins
+        if person_name:
+            matches = [f for f in detected
+                       if f['name'].lower() == person_name.lower()]
+            if matches:
+                target = max(matches, key=lambda f: f['score'])
+
+        # Priority 2 — partial first-name match
+        if target is None and person_name:
+            first = person_name.lower().split()[0]
+            matches = [f for f in detected if first in f['name'].lower()]
+            if matches:
+                target = max(matches, key=lambda f: f['score'])
+
+        # Priority 3 — centremost face (visitor always stands centre-frame)
+        if target is None:
+            frame_cx, frame_cy = fw // 2, fh // 2
+            target = min(detected,
+                         key=lambda f: abs(f['cx'] - frame_cx) +
+                                       abs(f['cy'] - frame_cy))
+            print(f"[CAPTURE_TARGETED] No name match for '{person_name}' — "
+                  f"using centremost face ({target['name']}, "
+                  f"score={target['score']:.3f})")
+        else:
+            print(f"[CAPTURE_TARGETED] Matched '{person_name}' → "
+                  f"'{target['name']}' (score={target['score']:.3f})")
+
+        # ── Full-body crop around target only ────────────────────────────────
+        x1, y1, x2, y2 = target['bbox']
+        face_h  = max(y2 - y1, 1)
+        face_w  = max(x2 - x1, 1)
+        face_cx = (x1 + x2) // 2
+
+        crop_x1 = max(0,  face_cx - int(face_w * 2.25))
+        crop_x2 = min(fw, face_cx + int(face_w * 2.25))
+        crop_y1 = max(0,  y1      - int(face_h * 0.35))
+        crop_y2 = min(fh, y1      + int(face_h * 7.0))
+
+        crop = frame[crop_y1:crop_y2, crop_x1:crop_x2]
+        if crop.size == 0:
+            return jsonify({'success': False, 'message': 'Crop region was empty'})
+
+        # ── Save snapshot ────────────────────────────────────────────────────
+        ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe     = (person_name or target['name']).replace(' ', '_')
+        filename = f"auto_{safe}_{ts}.jpg"
+        filepath = os.path.join(SNAPSHOTS_PATH, filename)
+        cv2.imwrite(filepath, crop, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        print(f"[CAPTURE_TARGETED] Saved: {filename}")
+
+        pos_desc = f"Detected: {target['name']}"
+        if target['name'].lower() != (person_name or '').lower():
+            pos_desc += f" (requested: {person_name})"
+
+        snap = {
+            'filename':      filename,
+            'person_name':   person_name or target['name'],
+            'position_desc': pos_desc,
+        }
+
+        # Keep pending_auto_snapshot in sync so the normal poll path also works
+        state.pending_auto_snapshot = snap
+        state.snapshot_locked       = True
+        state.last_snapshot_person  = snap['person_name']
+
+        return jsonify({'success': True, 'snapshot': snap})
+
+    except Exception as e:
+        import traceback
+        print(f"[CAPTURE_TARGETED] Error: {traceback.format_exc()}")
+        return jsonify({'success': False, 'message': str(e)})
+
+
 @app.route('/api/clear_command_after_finalise', methods=['POST'])
 def clear_command_after_finalise():
     """
@@ -2036,80 +2205,313 @@ class VedaSession:
     MAX_STEP = 7
 
     # ── Scripted responses — ALL VEDA text lives here ─────────────────────────
+    # _SCRIPTS = {
+    #     1: {
+    #         "prompt": (
+    #             "Hi there! I'm VEDA — your AI guide for this live demo. "
+    #             "In the next few minutes you'll see real-time face recognition, "
+    #             "a pencil sketch generated from your photo, and G-code sent straight "
+    #             "to a laser engraver. Want to give it a try?"
+    #         ),
+    #         "retry": "Totally fine to ask questions first! Want to jump in and see it live?",
+    #         "advance": lambda intent: intent == "YES",
+    #     },
+    #     2: {
+    #         "prompt": (
+    #             "Perfect! Step directly in front of the camera so the system can see "
+    #             "your face clearly. Just say 'ready' when you're in position."
+    #         ),
+    #         "retry": "Take your time — move until your face is visible on screen, then say 'ready'.",
+    #         "advance": lambda intent: intent == "YES",
+    #     },
+    #     3: {
+    #         "prompt": "Great — you're in frame! What's your first name?",
+    #         "retry":  "I didn't quite catch that — could you tell me your first name?",
+    #         "advance": lambda intent: intent.startswith("NAME:"),
+    #         "name_fn": lambda intent: intent[5:].capitalize() if intent.startswith("NAME:") else None,
+    #     },
+    #     4: {
+    #         "prompt": (
+    #             "Here's what happens next: the system will snap "
+    #             "your photo, turn it into a pencil sketch, then generate the G-code "
+    #             "that drives the laser engraver. Ready to go?"
+    #         ),
+    #         "retry": "No rush! Any questions? Otherwise just say 'ready' and we'll capture your photo.",
+    #         "advance": lambda intent: intent == "YES",
+    #     },
+    #     5: {
+    #         "prompt": "Hold perfectly still — capturing now!",
+    #         "retry":  "",
+    #         "advance": lambda intent: True,   # unconditional: countdown always advances
+    #     },
+    #     6: {
+    #         "prompt": (
+    #             "Thank you for your patience, {name}! The G-code is queued — "
+    #             "the robotics arm is positioning, parts are shifting into place, "
+    #             "and the laser is about to engrave your sketch. "
+    #             "You're going to love the result!"
+    #         ),
+    #         "retry":  "",
+    #         "advance": lambda intent: True,
+    #     },
+    #     7: {
+    #         "prompt": (
+    #             "Congratulations, {name} — you just experienced a fully automated "
+    #             "face-recognition-to-laser pipeline! This is just a slice of what "
+    #             "the system can do at scale: multi-person tracking, industrial automation, "
+    #             "custom laser workflows. Would you be open to a 20-minute deep-dive with the team?"
+    #         ),
+    #         "retry": "Completely understandable! Feel free to grab one of our cards — the team would love to connect.",
+    #         "advance": lambda intent: intent in ("YES", "NO"),
+    #     },
+    # }
+        # ── Scripted responses — 5 different variants per step ─────────────────────
+    # _SCRIPTS = {
+    #     1: {
+    #         "prompts": [
+    #             "Hi there! I'm VEDA — your AI guide for this live demo. In the next few minutes you'll see real-time face recognition, a pencil sketch generated from your photo, and G-code sent straight to a laser engraver. Want to give it a try?",
+    #             "Hello! I'm VEDA, your AI guide for this live demo. In the next few minutes you'll experience real-time face recognition, a pencil sketch created from your photo, and G-code driving a laser engraver. Ready to jump in?",
+    #             "Hey there! VEDA here — your AI host for today's live demo. Soon you'll see live face recognition, your photo turned into a pencil sketch, and G-code sent directly to the laser. Want to try it?",
+    #             "Welcome! I'm VEDA, guiding you through this live demo. In just a few minutes: real-time face recognition, a pencil sketch from your photo, and G-code powering the laser engraver. Up for it?",
+    #             "Greetings! I'm VEDA — your AI companion for this live demo. Get ready for real-time face recognition, a custom pencil sketch from your photo, and G-code sent straight to the laser. Shall we begin?",
+    #         ],
+    #         "retries": [
+    #             "Totally fine to ask questions first! Want to jump in and see it live?",
+    #             "No worries if you have questions! Feel like diving into the live demo?",
+    #             "Questions first? Totally cool! Ready to see it in action?",
+    #             "Ask anything you like! Want to jump straight into the live experience?",
+    #             "Happy to answer questions! Shall we start the live demo now?",
+    #         ],
+    #         "advance": lambda intent: intent == "YES",
+    #     },
+    #     2: {
+    #         "prompts": [
+    #             "Perfect! Step directly in front of the camera so the system can see your face clearly. Just say 'ready' when you're in position.",
+    #             "Awesome! Stand right in front of the camera so we get a clear view of your face. Say 'ready' when you're set.",
+    #             "Great! Position yourself directly in front of the camera for a sharp face capture. Tell me 'ready' once you're good to go.",
+    #             "Excellent! Move straight into the camera's view so your face is clearly visible. Say 'ready' when you're perfectly positioned.",
+    #             "Nice! Step up to the camera so the system can see your face perfectly. Just say 'ready' when you're all set.",
+    #         ],
+    #         "retries": [
+    #             "Take your time — move until your face is visible on screen, then say 'ready'.",
+    #             "No rush — adjust until your face shows clearly on screen, then say 'ready'.",
+    #             "Take a moment — get in front of the camera so your face is visible, then say 'ready'.",
+    #             "Relax and move around until your face appears clearly, then say 'ready'.",
+    #             "Feel free to reposition — make sure your face is visible on screen and say 'ready'.",
+    #         ],
+    #         "advance": lambda intent: intent == "YES",
+    #     },
+    #     3: {
+    #         "prompts": [
+    #             "Great — you're in frame! What's your first name?",
+    #             "Perfect — face locked in! May I have your first name?",
+    #             "You're in frame and looking great! What's your first name?",
+    #             "Awesome framing! Could you tell me your first name?",
+    #             "Face detected perfectly — you're in view! What's your first name?",
+    #         ],
+    #         "retries": [
+    #             "I didn't quite catch that — could you tell me your first name?",
+    #             "Sorry, I missed that — what's your first name?",
+    #             "I didn't hear clearly — could you share your first name again?",
+    #             "Hmm, didn't catch it — please tell me your first name?",
+    #             "Apologies, I didn't get that — what's your first name?",
+    #         ],
+    #         "advance": lambda intent: intent.startswith("NAME:"),
+    #         "name_fn": lambda intent: intent[5:].capitalize() if intent.startswith("NAME:") else None,
+    #     },
+    #     4: {
+    #         "prompts": [
+    #             "Here's what happens next: the system will snap your photo, turn it into a pencil sketch, then generate the G-code that drives the laser engraver. Ready to go?",
+    #             "Next step: we'll capture your photo, convert it into a pencil sketch, and create the G-code for the laser engraver. Ready to continue?",
+    #             "Here's the flow: photo capture, pencil sketch generation, then G-code sent to the laser. All set to begin?",
+    #             "Coming up: the system snaps your photo, creates a pencil sketch, and queues the G-code for the laser engraver. Ready?",
+    #             "In a moment: photo taken, turned into a pencil sketch, and G-code generated for the laser. Shall we go ahead?",
+    #         ],
+    #         "retries": [
+    #             "No rush! Any questions? Otherwise just say 'ready' and we'll capture your photo.",
+    #             "Take your time! Questions welcome — or say 'ready' to snap the photo.",
+    #             "No pressure! Got any questions? Just say 'ready' when you want to capture.",
+    #             "Whenever you're ready! Ask anything or say 'ready' to start the photo capture.",
+    #             "Relax — any questions first? Say 'ready' whenever you want to begin.",
+    #         ],
+    #         "advance": lambda intent: intent == "YES",
+    #     },
+    #     5: {
+    #         "prompts": [
+    #             "Hold perfectly still — capturing now!",
+    #             "Stay completely still — taking your photo right now!",
+    #             "Don't move a muscle — capturing the image now!",
+    #             "Hold steady — photo capture starting!",
+    #             "Freeze in place — we're snapping your photo now!",
+    #         ],
+    #         "retries": ["", "", "", "", ""],
+    #         "advance": lambda intent: True,
+    #     },
+    #     6: {
+    #         "prompts": [
+    #             "Thank you for your patience, {name}! The G-code is queued — the robotics arm is positioning, parts are shifting into place, and the laser is about to engrave your sketch. You're going to love the result!",
+    #             "Thanks for waiting, {name}! G-code is queued — the robotic arm is moving into position, components are aligning, and the laser is about to engrave your sketch. You're in for a treat!",
+    #             "Appreciate your patience, {name}! The G-code is ready — robotics arm positioning, parts shifting, laser preparing to engrave your sketch. This is going to look amazing!",
+    #             "Thank you for holding on, {name}! G-code queued up — the arm is getting into place, everything aligning, and your sketch is about to be laser engraved. You're going to love it!",
+    #             "Thanks a lot for your patience, {name}! We've queued the G-code — robotic arm adjusting, parts moving into position, and the laser will soon engrave your sketch. This will be awesome!",
+    #         ],
+    #         "retries": ["", "", "", "", ""],
+    #         "advance": lambda intent: True,
+    #     },
+    #     7: {
+    #         "prompts": [
+    #             "Congratulations, {name} — you just experienced a fully automated face-recognition-to-laser pipeline! This is just a slice of what the system can do at scale: multi-person tracking, industrial automation, custom laser workflows. Would you be open to a 20-minute deep-dive with the team?",
+    #             "Well done, {name}! You've just seen a complete automated face-to-laser pipeline! This is only the beginning — multi-person tracking, industrial automation, and custom laser workflows are all possible. Interested in a 20-minute deep dive with the team?",
+    #             "Congratulations, {name} — what an experience with our fully automated face-recognition-to-laser system! This demo is just the tip of the iceberg: multi-person tracking, industrial-scale automation, and tailored laser processes. Open to a 20-minute deep-dive?",
+    #             "Fantastic, {name}! You've witnessed a seamless face-to-laser engraving pipeline. This is just a taste of the full system: multi-person tracking, advanced industrial automation, and custom laser workflows. Would you like a 20-minute in-depth session with the team?",
+    #             "Bravo, {name}! You've experienced our end-to-end automated face-recognition-to-laser pipeline! Just a glimpse of what's possible at scale — multi-person tracking, industrial automation, and bespoke laser operations. How about a 20-minute deep-dive with our team?",
+    #         ],
+    #         "retries": [
+    #             "Completely understandable! Feel free to grab one of our cards — the team would love to connect.",
+    #             "That's perfectly okay! Go ahead and take a card — the team would love to chat later.",
+    #             "No worries at all! Grab one of our cards — we'd be thrilled to connect with you.",
+    #             "Understood! Feel free to take a card; the team is eager to follow up.",
+    #             "Totally fine! Pick up a card — the team would really enjoy speaking with you.",
+    #         ],
+    #         "advance": lambda intent: intent in ("YES", "NO"),
+    #     },
+    # }
+    # _CLOSE_YES = "Fantastic! Someone from the team will be in touch very soon. Thank you for joining us today!"
+    # _CLOSE_NO  = "No worries at all — grab a card on your way out. Thanks for joining us today!"
+
+    # # Confirmation lines spoken before the next step's opening prompt
+    # _CONFIRM = {
+    #     1: "Great, let's do it!",
+    #     2: "Excellent — I can see you clearly.",
+    #     3: "",   # filled dynamically with "Nice to meet you, {name}!"
+    #     4: "Perfect!",
+    #     5: "",
+    #     6: "",
+    # }
+        # ── Scripted responses — 5 different variants per step ─────────────────────
     _SCRIPTS = {
         1: {
-            "prompt": (
-                "Hi there! I'm VEDA — your AI guide for this live demo. "
-                "In the next few minutes you'll see real-time face recognition, "
-                "a pencil sketch generated from your photo, and G-code sent straight "
-                "to a laser engraver. Want to give it a try?"
-            ),
-            "retry": "Totally fine to ask questions first! Want to jump in and see it live?",
+            "prompts": [
+                "Hi there! I'm VEDA — your AI guide for this live demo. In the next few minutes you'll see real-time face recognition, a pencil sketch generated from your photo, and G-code sent straight to a laser engraver. Want to give it a try?",
+                "Hello! I'm VEDA, your AI guide for this live demo. In the next few minutes you'll experience real-time face recognition, a pencil sketch created from your photo, and G-code driving a laser engraver. Ready to jump in?",
+                "Hey there! VEDA here — your AI host for today's live demo. Soon you'll see live face recognition, your photo turned into a pencil sketch, and G-code sent directly to the laser. Want to try it?",
+                "Welcome! I'm VEDA, guiding you through this live demo. In just a few minutes: real-time face recognition, a pencil sketch from your photo, and G-code powering the laser engraver. Up for it?",
+                "Greetings! I'm VEDA — your AI companion for this live demo. Get ready for real-time face recognition, a custom pencil sketch from your photo, and G-code sent straight to the laser. Shall we begin?",
+            ],
+            "retries": [
+                "Totally fine to ask questions first! Want to jump in and see it live?",
+                "No worries if you have questions! Feel like diving into the live demo?",
+                "Questions first? Totally cool! Ready to see it in action?",
+                "Ask anything you like! Want to jump straight into the live experience?",
+                "Happy to answer questions! Shall we start the live demo now?",
+            ],
             "advance": lambda intent: intent == "YES",
         },
         2: {
-            "prompt": (
-                "Perfect! Step directly in front of the camera so the system can see "
-                "your face clearly. Just say 'ready' when you're in position."
-            ),
-            "retry": "Take your time — move until your face is visible on screen, then say 'ready'.",
+            "prompts": [
+                "Perfect! Step directly in front of the camera so the system can see your face clearly. Just say 'ready' when you're in position.",
+                "Awesome! Stand right in front of the camera so we get a clear view of your face. Say 'ready' when you're set.",
+                "Great! Position yourself directly in front of the camera for a sharp face capture. Tell me 'ready' once you're good to go.",
+                "Excellent! Move straight into the camera's view so your face is clearly visible. Say 'ready' when you're perfectly positioned.",
+                "Nice! Step up to the camera so the system can see your face perfectly. Just say 'ready' when you're all set.",
+            ],
+            "retries": [
+                "Take your time — move until your face is visible on screen, then say 'ready'.",
+                "No rush — adjust until your face shows clearly on screen, then say 'ready'.",
+                "Take a moment — get in front of the camera so your face is visible, then say 'ready'.",
+                "Relax and move around until your face appears clearly, then say 'ready'.",
+                "Feel free to reposition — make sure your face is visible on screen and say 'ready'.",
+            ],
             "advance": lambda intent: intent == "YES",
         },
         3: {
-            "prompt": "Great — you're in frame! What's your first name?",
-            "retry":  "I didn't quite catch that — could you tell me your first name?",
+            "prompts": [
+                "Great — you're in frame! What's your first name?",
+                "Perfect — face locked in! May I have your first name?",
+                "You're in frame and looking great! What's your first name?",
+                "Awesome framing! Could you tell me your first name?",
+                "Face detected perfectly — you're in view! What's your first name?",
+            ],
+            "retries": [
+                "I didn't quite catch that — could you tell me your first name?",
+                "Sorry, I missed that — what's your first name?",
+                "I didn't hear clearly — could you share your first name again?",
+                "Hmm, didn't catch it — please tell me your first name?",
+                "Apologies, I didn't get that — what's your first name?",
+            ],
             "advance": lambda intent: intent.startswith("NAME:"),
             "name_fn": lambda intent: intent[5:].capitalize() if intent.startswith("NAME:") else None,
         },
         4: {
-            "prompt": (
-                "Here's what happens next: the system will snap "
-                "your photo, turn it into a pencil sketch, then generate the G-code "
-                "that drives the laser engraver. Ready to go?"
-            ),
-            "retry": "No rush! Any questions? Otherwise just say 'ready' and we'll capture your photo.",
+            "prompts": [
+                "Here's what happens next: the system will snap your photo, turn it into a pencil sketch, then generate the G-code that drives the laser engraver. Ready to go?",
+                "Next step: we'll capture your photo, convert it into a pencil sketch, and create the G-code for the laser engraver. Ready to continue?",
+                "Here's the flow: photo capture, pencil sketch generation, then G-code sent to the laser. All set to begin?",
+                "Coming up: the system snaps your photo, creates a pencil sketch, and queues the G-code for the laser engraver. Ready?",
+                "In a moment: photo taken, turned into a pencil sketch, and G-code generated for the laser. Shall we go ahead?",
+            ],
+            "retries": [
+                "No rush! Any questions? Otherwise just say 'ready' and we'll capture your photo.",
+                "Take your time! Questions welcome — or say 'ready' to snap the photo.",
+                "No pressure! Got any questions? Just say 'ready' when you want to capture.",
+                "Whenever you're ready! Ask anything or say 'ready' to start the photo capture.",
+                "Relax — any questions first? Say 'ready' whenever you want to begin.",
+            ],
             "advance": lambda intent: intent == "YES",
         },
         5: {
-            "prompt": "Awesome — hold perfectly still! Three… two… one… capturing!",
-            "retry":  "",
-            "advance": lambda intent: True,   # unconditional: countdown always advances
+            "prompts": [
+                "Hold perfectly still — capturing now!",
+                "Stay completely still — taking your photo right now!",
+                "Don't move a muscle — capturing the image now!",
+                "Hold steady — photo capture starting!",
+                "Freeze in place — we're snapping your photo now!",
+            ],
+            "retries": ["", "", "", "", ""],
+            "advance": lambda intent: True,
         },
         6: {
-            "prompt": (
-                "Thank you for your patience, {name}! The G-code is queued — "
-                "the robotics arm is positioning, parts are shifting into place, "
-                "and the laser is about to engrave your sketch. "
-                "You're going to love the result!"
-            ),
-            "retry":  "",
+            "prompts": [
+                "Thank you for your patience, {name}! The G-code is queued — the robotics arm is positioning, parts are shifting into place, and the laser is about to engrave your sketch. You're going to love the result!",
+                "Thanks for waiting, {name}! G-code is queued — the robotic arm is moving into position, components are aligning, and the laser is about to engrave your sketch. You're in for a treat!",
+                "Appreciate your patience, {name}! The G-code is ready — robotics arm positioning, parts shifting, laser preparing to engrave your sketch. This is going to look amazing!",
+                "Thank you for holding on, {name}! G-code queued up — the arm is getting into place, everything aligning, and your sketch is about to be laser engraved. You're going to love it!",
+                "Thanks a lot for your patience, {name}! We've queued the G-code — robotic arm adjusting, parts moving into position, and the laser will soon engrave your sketch. This will be awesome!",
+            ],
+            "retries": ["", "", "", "", ""],
             "advance": lambda intent: True,
         },
         7: {
-            "prompt": (
-                "Congratulations, {name} — you just experienced a fully automated "
-                "face-recognition-to-laser pipeline! This is just a slice of what "
-                "the system can do at scale: multi-person tracking, industrial automation, "
-                "custom laser workflows. Would you be open to a 20-minute deep-dive with the team?"
-            ),
-            "retry": "Completely understandable! Feel free to grab one of our cards — the team would love to connect.",
+            "prompts": [
+                "Congratulations, {name} — you just experienced a fully automated face-recognition-to-laser pipeline! This is just a slice of what the system can do at scale: multi-person tracking, industrial automation, custom laser workflows. Would you be open to a 20-minute deep-dive with the team?",
+                "Well done, {name}! You've just seen a complete automated face-to-laser pipeline! This is only the beginning — multi-person tracking, industrial automation, and custom laser workflows are all possible. Interested in a 20-minute deep dive with the team?",
+                "Congratulations, {name} — what an experience with our fully automated face-recognition-to-laser system! This demo is just the tip of the iceberg: multi-person tracking, industrial-scale automation, and tailored laser processes. Open to a 20-minute deep-dive?",
+                "Fantastic, {name}! You've witnessed a seamless face-to-laser engraving pipeline. This is just a taste of the full system: multi-person tracking, advanced industrial automation, and custom laser workflows. Would you like a 20-minute in-depth session with the team?",
+                "Bravo, {name}! You've experienced our end-to-end automated face-recognition-to-laser pipeline! Just a glimpse of what's possible at scale — multi-person tracking, industrial automation, and bespoke laser operations. How about a 20-minute deep-dive with our team?",
+            ],
+            "retries": [
+                "Completely understandable! Feel free to grab one of our cards — the team would love to connect.",
+                "That's perfectly okay! Go ahead and take a card — the team would love to chat later.",
+                "No worries at all! Grab one of our cards — we'd be thrilled to connect with you.",
+                "Understood! Feel free to take a card; the team is eager to follow up.",
+                "Totally fine! Pick up a card — the team would really enjoy speaking with you.",
+            ],
             "advance": lambda intent: intent in ("YES", "NO"),
         },
     }
 
+
     _CLOSE_YES = "Fantastic! Someone from the team will be in touch very soon. Thank you for joining us today!"
     _CLOSE_NO  = "No worries at all — grab a card on your way out. Thanks for joining us today!"
 
-    # Confirmation lines spoken before the next step's opening prompt
     _CONFIRM = {
         1: "Great, let's do it!",
         2: "Excellent — I can see you clearly.",
-        3: "",   # filled dynamically with "Nice to meet you, {name}!"
-        4: "Perfect — hold still!",
+        3: "",   # filled dynamically
+        4: "Perfect!",
         5: "",
         6: "",
     }
-
     def __init__(self):
         self.reset()
 
@@ -2118,28 +2520,36 @@ class VedaSession:
         self.visitor_name  = None
         self.full_log      = []
         self.done_steps    = set()
+        self.chosen_prompts = {}   # step → randomly chosen prompt
+        self.chosen_retries = {}   # step → randomly chosen retry
         self._lock         = threading.Lock()
 
     # ── Public API ────────────────────────────────────────────────────────────
+    def _get_prompt(self, step: int, name: str = None) -> str:
+        script = self._SCRIPTS.get(step, self._SCRIPTS[7])
+        if step not in self.chosen_prompts:
+            self.chosen_prompts[step] = random.choice(script["prompts"])
+        prompt = self.chosen_prompts[step]
+        if "{name}" in prompt:
+            n = name or self.visitor_name or "there"
+            prompt = prompt.replace("{name}", n)
+        return prompt
 
+    def _get_retry(self, step: int) -> str:
+        script = self._SCRIPTS.get(step, self._SCRIPTS[7])
+        if step not in self.chosen_retries:
+            self.chosen_retries[step] = random.choice(script["retries"])
+        return self.chosen_retries[step]
+
+    # ── Updated process method ───────────────────────────────────────────────
     def process(self, user_text: str) -> dict:
-        """
-        Classify visitor input → deterministic reply + advance signal.
-
-        Special synthetic inputs (not from the visitor):
-          __BOOT__             → return opening prompt for current step
-          __SNAPSHOT_DONE__    → advance step 5→6, return step 6 hardware msg
-          __HARDWARE_STARTED__ → alias for __SNAPSHOT_DONE__
-          __TIMEOUT__          → return a timeout recovery line
-        """
         with self._lock:
             step = self.current_step
-
         script = self._SCRIPTS.get(step, self._SCRIPTS[7])
 
-        # ── Synthetic server events ───────────────────────────────────────────
+        # Synthetic server events
         if user_text == "__BOOT__":
-            reply = self._fmt(script["prompt"])
+            reply = self._get_prompt(step)
             self._log(step, "__boot__", reply)
             return {"reply": reply, "step": step, "advance": False, "name": None}
 
@@ -2149,7 +2559,7 @@ class VedaSession:
                     self.done_steps.add(5)
                     self.current_step = 6
                     step = 6
-            reply = self._fmt(self._SCRIPTS[6]["prompt"])
+            reply = self._get_prompt(6)
             self._log(6, "__snapshot_done__", reply)
             return {"reply": reply, "step": 5, "advance": True, "name": None}
 
@@ -2157,14 +2567,13 @@ class VedaSession:
             reply = "Hmm, I lost sight of you — no worries! Say 'capture' whenever you're ready and we'll try again."
             return {"reply": reply, "step": step, "advance": False, "name": None}
 
-        # ── Classify visitor input ────────────────────────────────────────────
+        # Classify visitor input
         intent = "YES" if step == 5 else _classify_intent(user_text)
         print(f"[VEDA] step={step} intent={intent!r} input={user_text!r}")
 
-        # ── Decide reply ──────────────────────────────────────────────────────
-        advance  = False
+        advance = False
         name_out = None
-        reply    = ""
+        reply = ""
 
         if script["advance"](intent):
             advance = True
@@ -2173,22 +2582,19 @@ class VedaSession:
                 name_out = name_fn(intent)
 
             if step == 7:
-                # Sales close — pick YES or NO response
                 reply = self._CLOSE_YES if intent == "YES" else self._CLOSE_NO
             else:
-                # Confirmation line + next step's opening prompt
                 if step == 3:
                     confirm = f"Nice to meet you, {name_out or 'there'}!"
                 else:
                     confirm = self._CONFIRM.get(step, "")
 
-                next_step   = step + 1
-                next_script = self._SCRIPTS.get(next_step)
-                if next_script and step < 6:
-                    next_prompt = self._fmt(next_script["prompt"], name=name_out)
+                next_step = step + 1
+                if next_step <= self.MAX_STEP:
+                    next_prompt = self._get_prompt(next_step, name=name_out)
                     reply = f"{confirm} {next_prompt}".strip() if confirm else next_prompt
                 else:
-                    reply = confirm or self._fmt(script["prompt"])
+                    reply = confirm or self._get_prompt(step)
 
             # Lock step and advance
             with self._lock:
@@ -2198,21 +2604,108 @@ class VedaSession:
                         self.visitor_name = name_out
                     if self.current_step < self.MAX_STEP:
                         self.current_step += 1
+
         else:
-            # Not advancing — return retry line
-            reply = script.get("retry") or self._fmt(script["prompt"])
+            # Not advancing → use retry line
+            retry = self._get_retry(step)
+            reply = retry or self._get_prompt(step)
             if not reply:
                 reply = "Whenever you're ready — just say the word."
 
         self._log(step, user_text, reply)
         return {"reply": reply.strip(), "step": step, "advance": advance, "name": name_out}
+    
+    # def process(self, user_text: str) -> dict:
+    #     """
+    #     Classify visitor input → deterministic reply + advance signal.
+
+    #     Special synthetic inputs (not from the visitor):
+    #       __BOOT__             → return opening prompt for current step
+    #       __SNAPSHOT_DONE__    → advance step 5→6, return step 6 hardware msg
+    #       __HARDWARE_STARTED__ → alias for __SNAPSHOT_DONE__
+    #       __TIMEOUT__          → return a timeout recovery line
+    #     """
+    #     with self._lock:
+    #         step = self.current_step
+
+    #     script = self._SCRIPTS.get(step, self._SCRIPTS[7])
+
+    #     # ── Synthetic server events ───────────────────────────────────────────
+    #     if user_text == "__BOOT__":
+    #         reply = self._fmt(script["prompt"])
+    #         self._log(step, "__boot__", reply)
+    #         return {"reply": reply, "step": step, "advance": False, "name": None}
+
+    #     if user_text in ("__SNAPSHOT_DONE__", "__HARDWARE_STARTED__"):
+    #         with self._lock:
+    #             if self.current_step == 5:
+    #                 self.done_steps.add(5)
+    #                 self.current_step = 6
+    #                 step = 6
+    #         reply = self._fmt(self._SCRIPTS[6]["prompt"])
+    #         self._log(6, "__snapshot_done__", reply)
+    #         return {"reply": reply, "step": 5, "advance": True, "name": None}
+
+    #     if user_text == "__TIMEOUT__":
+    #         reply = "Hmm, I lost sight of you — no worries! Say 'capture' whenever you're ready and we'll try again."
+    #         return {"reply": reply, "step": step, "advance": False, "name": None}
+
+    #     # ── Classify visitor input ────────────────────────────────────────────
+    #     intent = "YES" if step == 5 else _classify_intent(user_text)
+    #     print(f"[VEDA] step={step} intent={intent!r} input={user_text!r}")
+
+    #     # ── Decide reply ──────────────────────────────────────────────────────
+    #     advance  = False
+    #     name_out = None
+    #     reply    = ""
+
+    #     if script["advance"](intent):
+    #         advance = True
+    #         name_fn = script.get("name_fn")
+    #         if name_fn:
+    #             name_out = name_fn(intent)
+
+    #         if step == 7:
+    #             # Sales close — pick YES or NO response
+    #             reply = self._CLOSE_YES if intent == "YES" else self._CLOSE_NO
+    #         else:
+    #             # Confirmation line + next step's opening prompt
+    #             if step == 3:
+    #                 confirm = f"Nice to meet you, {name_out or 'there'}!"
+    #             else:
+    #                 confirm = self._CONFIRM.get(step, "")
+
+    #             next_step   = step + 1
+    #             next_script = self._SCRIPTS.get(next_step)
+    #             if next_script and step < 6:
+    #                 next_prompt = self._fmt(next_script["prompt"], name=name_out)
+    #                 reply = f"{confirm} {next_prompt}".strip() if confirm else next_prompt
+    #             else:
+    #                 reply = confirm or self._fmt(script["prompt"])
+
+    #         # Lock step and advance
+    #         with self._lock:
+    #             if self.current_step == step:
+    #                 self.done_steps.add(step)
+    #                 if step == 3 and name_out:
+    #                     self.visitor_name = name_out
+    #                 if self.current_step < self.MAX_STEP:
+    #                     self.current_step += 1
+    #     else:
+    #         # Not advancing — return retry line
+    #         reply = script.get("retry") or self._fmt(script["prompt"])
+    #         if not reply:
+    #             reply = "Whenever you're ready — just say the word."
+
+    #     self._log(step, user_text, reply)
+    #     return {"reply": reply.strip(), "step": step, "advance": advance, "name": name_out}
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
-    def _fmt(self, template: str, name: str = None) -> str:
-        """Substitute {name} with visitor name (or extracted name or 'there')."""
-        n = name or self.visitor_name or "there"
-        return template.replace("{name}", n)
+    # def _fmt(self, template: str, name: str = None) -> str:
+    #     """Substitute {name} with visitor name (or extracted name or 'there')."""
+    #     n = name or self.visitor_name or "there"
+    #     return template.replace("{name}", n)
 
     def _log(self, step, user_text, reply):
         self.full_log.append({"step": step, "role": "user",      "content": user_text})
@@ -2256,25 +2749,53 @@ def _classify_intent(user_text: str) -> str:
         'standing','sitting','positioned','waiting','all','just','at','the','a',
         'an','front','facing','behind','close','near','aligned','visible','back',
         'still','stable','straight','present','up','looking','right','left','center',
-        'coming','moving','position','camera','frame','screen'
+        'coming','moving','position','camera','frame','screen',
+        # Extended — common YES/state words that could be mistaken for names
+        'going','starting','beginning','proceeding','capturing','confirming',
+        'cool','totally','definitely','absolutely','certainly','indeed','correct',
+        'awesome','fantastic','excellent','great','perfect','sure','yes',
+        'lined','capture','aligned',
     }
 
-    # ── YES patterns — checked FIRST ─────────────────────────────────────────
+    # ── Bare single word (any case, 2-20 chars) → treat as a name ────────────
+    # YES_RE runs first, so common affirmatives (hi, ok, sure…) are already filtered.
+    BARE_NAME_RE = re.compile(r'^([A-Za-z]{2,20})$')
     YES_RE = re.compile(
         r'\b(yes|yeah|yep|yup|sure|ok|okay|go|ready|proceed|start|begin|'
-        r'lets?\s+go|go ahead|do it|sounds good|why not|absolutely|'
-        r'of course|alright|fine|cool|great|perfect|hi|hello|hey|'
-        r'interested|fascinating|nice|wow|in position|in frame|'
-        r'standing here|right here|all set|good to go|can see me|see me now|'
-        r'i\'?m here|i\'?m ready|i\'?m set|i\'?m in|here i am)\b'
-        r'|i am (here|ready|set|in|standing|positioned|visible|there|present|good)',
+        r'lets?\s+go|go\s+ahead|do\s+it|sounds?\s+good|why\s+not|absolutely|'
+        r'of\s+course|alright|al\s+right|fine|cool|great|perfect|awesome|'
+        r'fantastic|excellent|brilliant|wonderful|definitely|certainly|'
+        r'affirmative|roger|correct|exactly|indeed|true|positive|'
+        r'hi|hello|hey|sup|greetings|howdy|'
+        r'interested|fascinating|nice|wow|amazing|impressive|'
+        r'in\s+position|in\s+frame|in\s+place|'
+        r'standing\s+here|right\s+here|here\s+now|all\s+set|'
+        r'good\s+to\s+go|can\s+see\s+me|see\s+me\s+now|'
+        r'i\'?m\s+here|i\'?m\s+ready|i\'?m\s+set|i\'?m\s+in|here\s+i\s+am|'
+        r'let\'?s\s+do\s+this|let\'?s\s+start|let\'?s\s+begin|'
+        r'bring\s+it\s+on|go\s+for\s+it|try\s+it|show\s+me|'
+        r'capture|snap|take\s+it|shoot|click|'
+        r'yea|ya|yas|yass|for\s+sure|totally|absolutely|'
+        r'happy\s+to|love\s+to|would\s+love|'
+        r'on\s+my\s+way|coming|here\s+we\s+go|'
+        r'no\s+problem|no\s+worries|no\s+issue|'
+        r'present|set|done|lined\s+up|positioned|'
+        r'confirmed|confirm|accepted|accept|'
+        r'proceed|move\s+on|continue|next)\b'
+        r'|i\s+am\s+(here|ready|set|in|standing|positioned|visible|there|present|good|coming|'
+        r'all\s+set|in\s+frame|in\s+position|lined\s+up|'
+        r'looking\s+at|facing|front|center)',
         re.IGNORECASE
     )
 
     # ── NO patterns ───────────────────────────────────────────────────────────
     NO_RE = re.compile(
-        r'\b(no|nope|nah|stop|cancel|quit|exit|don\'?t|'
-        r'hesitant|wait|hold on|later|busy|wrong|pass)\b'
+        r'\b(no|nope|nah|nah|stop|cancel|quit|exit|don\'?t|'
+        r'hesitant|wait|hold\s+on|later|busy|wrong|pass|'
+        r'not\s+now|not\s+ready|not\s+yet|maybe\s+later|'
+        r'skip|decline|refuse|reject|negative|'
+        r'i\'?m\s+not|i\s+don\'?t|i\s+won\'?t|i\s+can\'?t|'
+        r'no\s+thanks|no\s+thank\s+you|not\s+interested)\b'
     )
 
     # # ── Name phrase patterns — "I am X", "My name is X", "Call me X" ─────────
@@ -2287,7 +2808,8 @@ def _classify_intent(user_text: str) -> str:
     r'(?:'
     r'i[\s\']+am|'
     r'i\'?m|'
-    r'my name is|'
+    r'my name(?:\'s| is)|'
+    r'my first name(?:\'s| is)|'
     r'call me|'
     r'you can call me|'
     r'people call me|'
@@ -2298,25 +2820,33 @@ def _classify_intent(user_text: str) -> str:
     r'it\'?s|'
     r'the name(?:\'s| is)|'
     r'known as|'
-    r'(?:hi|hello|hey),?\s*(?:i[\s\']+am|i\'?m|my name is)?|'
+    r'goes? by|'
+    r'(?:hi|hello|hey|howdy),?\s*(?:i[\s\']+am|i\'?m|my name is)?|'
     r'myself|'
     r'i go by|'
-    r'raj here|'
-    r'speaking'
+    r'speaking|'
+    r'here,?\s*(?:i[\s\']+am|i\'?m)?|'
+    r'name\'?s|'
+    r'they\s+call\s+me|'
+    r'you\s+can\s+call\s+me|'
+    r'everyone\s+calls?\s+me|'
+    r'friends?\s+call\s+me'
     r')\s+'
-    r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,1,2})',   # 1–3 word name (very safe)
+    r'([A-Za-z][a-z]{1,19}(?:\s+[A-Za-z][a-z]{1,19}){0,2})',   # 1–3 word name
     re.IGNORECASE
 )
 
-    # ── Bare single capitalised word → treat as name ──────────────────────────
-    BARE_NAME_RE = re.compile(r'^([A-Z][a-z]{1,19})$')
+    # ── Bare single word (any case, 2-20 chars) → treated as a name ─────────
+    # YES_RE already consumed all common affirmatives, so what remains here
+    # is almost always a person introducing themselves with just their name.
+    BARE_NAME_RE = re.compile(r'^([A-Za-z]{2,20})$')
 
     # Order matters: YES first, then name, then NO
     if YES_RE.search(tl):
         return "YES"
 
     bn = BARE_NAME_RE.match(user_text.strip())
-    if bn:
+    if bn and bn.group(1).lower() not in _NON_NAME_WORDS:
         return f"NAME:{bn.group(1).capitalize()}"
 
     nm = NAME_RE.search(user_text)
@@ -2353,7 +2883,7 @@ def _classify_intent(user_text: str) -> str:
             headers={"Content-Type": "application/json"},
             method="POST"
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=40) as resp:
             obj   = json.loads(resp.read().decode("utf-8"))
             token = obj.get("message", {}).get("content", "").strip().upper()
 
@@ -2523,7 +3053,7 @@ def ollama_health():
     """
     try:
         req = urllib.request.Request("http://localhost:11434/api/tags", method="GET")
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         models   = [m["name"].split(":")[0] for m in data.get("models", [])]
         model_ok = OLLAMA_MODEL in models or any(OLLAMA_MODEL in m for m in models)
