@@ -47,7 +47,11 @@ EMBEDDINGS_PATH        = "embeddings/face_embeddings.pkl"
 SNAPSHOTS_PATH         = "snapshots"
 GCODE_PATH             = "gcode"
 
-RECOGNITION_THRESHOLD  = 0.45
+RECOGNITION_THRESHOLD  = 0.38   # Lowered from 0.45 → real-world ArcFace R100
+                                # cosine scores drop due to lighting/pose variation.
+                                # 0.75 = excellent | 0.50 = good | 0.38 = borderline
+                                # Raise if getting false-positive matches.
+RECOGNITION_THRESHOLD_SOFT = 0.28  # Used only in capture_targeted as last resort.
 
 # ── Ollama config (classifier only — NOT used for free-form chat) ─────────────
 # The LLM is now used ONLY as a constrained classifier for ambiguous inputs.
@@ -1373,7 +1377,7 @@ def generate_embeddings_from_dataset():
 
 @app.route('/')
 def index():
-    return render_template('index1.html')  # VEDA UI
+    return render_template('index2.html')  # VEDA UI
 
 @app.route('/capture')
 def capture_page():
@@ -1596,6 +1600,96 @@ def get_pending_snapshot():
         state.pending_auto_snapshot = None   # consume
         return jsonify({'success': True, 'snapshot': snap})
     return jsonify({'success': False, 'snapshot': None})
+
+
+@app.route('/api/recognition_debug', methods=['GET'])
+def recognition_debug():
+    """
+    Live recognition score debugger.
+    Open in browser while standing in front of camera:
+      http://localhost:5000/api/recognition_debug
+
+    Shows the exact cosine similarity score your face gets against every
+    known person in the dataset — so you can tune RECOGNITION_THRESHOLD.
+
+    Score guide (ArcFace R100):
+      0.70+  Excellent — very confident match
+      0.50+  Good      — reliable match
+      0.38+  Accepted  — current hard threshold
+      0.28+  Soft zone — capture_targeted last resort
+      <0.28  No match  — add more dataset photos
+    """
+    try:
+        frame, _ = state.raw_slot.read()
+        if frame is None:
+            return jsonify({'error': 'No camera frame — is the camera running?'})
+        if state.recognizer is None:
+            return jsonify({'error': 'Recognizer not loaded yet'})
+        if state.normalized_embeddings is None or len(state.normalized_embeddings) == 0:
+            return jsonify({'error': 'No embeddings — click Generate Embeddings first'})
+
+        fh, fw = frame.shape[:2]
+        small_w = int(fw * DETECT_FRAME_SCALE)
+        small_h = int(fh * DETECT_FRAME_SCALE)
+        detect_frame = cv2.resize(frame, (small_w, small_h), interpolation=cv2.INTER_LINEAR)
+        faces = state.recognizer.get(np.ascontiguousarray(detect_frame))
+        scale_x = fw / small_w
+        scale_y = fh / small_h
+
+        if not faces:
+            return jsonify({
+                'faces':   [],
+                'message': 'No faces detected — step closer to the camera',
+                'threshold_hard': RECOGNITION_THRESHOLD,
+                'threshold_soft': RECOGNITION_THRESHOLD_SOFT,
+                'known_names':    state.known_names,
+                'total_embeddings': len(state.normalized_embeddings),
+            })
+
+        emb_batch = np.array([f["normed_embedding"] for f in faces], dtype=np.float32)
+        sims      = fast_cosine_batch(emb_batch, state.normalized_embeddings)
+
+        results = []
+        for i, face in enumerate(faces):
+            raw_bbox = face["bbox"].astype(int)
+            bbox = [int(raw_bbox[0]*scale_x), int(raw_bbox[1]*scale_y),
+                    int(raw_bbox[2]*scale_x), int(raw_bbox[3]*scale_y)]
+            area = (bbox[2]-bbox[0]) * (bbox[3]-bbox[1])
+
+            best_idx   = int(np.argmax(sims[i]))
+            best_score = float(sims[i, best_idx])
+            best_name  = state.known_names[best_idx]
+            recognized = best_score >= RECOGNITION_THRESHOLD
+
+            # Per-person scores sorted best-first
+            all_scores = {
+                state.known_names[j]: round(float(sims[i, j]), 4)
+                for j in range(len(state.known_names))
+            }
+            all_scores = dict(sorted(all_scores.items(), key=lambda x: -x[1]))
+
+            results.append({
+                'face_index':  i + 1,
+                'best_name':   best_name,
+                'best_score':  round(best_score, 4),
+                'recognized':  recognized,
+                'bbox_area':   area,
+                'all_scores':  all_scores,
+            })
+
+        return jsonify({
+            'faces':              results,
+            'threshold_hard':     RECOGNITION_THRESHOLD,
+            'threshold_soft':     RECOGNITION_THRESHOLD_SOFT,
+            'known_names':        state.known_names,
+            'total_embeddings':   len(state.normalized_embeddings),
+            'tip': (f"Score >= {RECOGNITION_THRESHOLD} = recognized. "
+                    f"Raise threshold if getting wrong matches; lower if known people show as Unknown."),
+        })
+
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'trace': traceback.format_exc()})
 
 
 @app.route('/api/detect_clothing_color', methods=['POST'])
@@ -1940,14 +2034,21 @@ def capture_targeted():
                                  'bbox': bbox, 'cx': cx, 'cy': cy})
 
         # ── Select the target face ───────────────────────────────────────────
-        target = None
+        # Print all scores to terminal so you can see what's happening live.
+        print(f"[CAPTURE_TARGETED] Looking for '{person_name}' — {len(detected)} face(s):")
+        for i, d in enumerate(detected):
+            print(f"  Face {i+1}: name={d['name']!r}  score={d['score']:.4f}  cx={d['cx']}")
 
-        # Priority 1 — exact name match, best score wins
+        target    = None
+        frame_cx  = fw // 2
+        frame_cy  = fh // 2
+
+        # Priority 1 — exact name match above hard threshold, best score wins
         if person_name:
-            matches = [f for f in detected
-                       if f['name'].lower() == person_name.lower()]
+            matches = [f for f in detected if f['name'].lower() == person_name.lower()]
             if matches:
                 target = max(matches, key=lambda f: f['score'])
+                print(f"[CAPTURE_TARGETED] ✓ Priority-1 exact: '{target['name']}' score={target['score']:.4f}")
 
         # Priority 2 — partial first-name match
         if target is None and person_name:
@@ -1955,19 +2056,26 @@ def capture_targeted():
             matches = [f for f in detected if first in f['name'].lower()]
             if matches:
                 target = max(matches, key=lambda f: f['score'])
+                print(f"[CAPTURE_TARGETED] ✓ Priority-2 partial: '{target['name']}' score={target['score']:.4f}")
 
-        # Priority 3 — centremost face (visitor always stands centre-frame)
+        # Priority 3 — soft threshold (catches borderline lighting scores)
         if target is None:
-            frame_cx, frame_cy = fw // 2, fh // 2
-            target = min(detected,
-                         key=lambda f: abs(f['cx'] - frame_cx) +
-                                       abs(f['cy'] - frame_cy))
-            print(f"[CAPTURE_TARGETED] No name match for '{person_name}' — "
-                  f"using centremost face ({target['name']}, "
-                  f"score={target['score']:.3f})")
-        else:
-            print(f"[CAPTURE_TARGETED] Matched '{person_name}' → "
-                  f"'{target['name']}' (score={target['score']:.3f})")
+            soft = [f for f in detected if f['score'] >= RECOGNITION_THRESHOLD_SOFT]
+            if soft:
+                target = min(soft, key=lambda f: abs(f['cx'] - frame_cx) + abs(f['cy'] - frame_cy))
+                print(f"[CAPTURE_TARGETED] ⚠ Priority-3 soft: '{target['name']}' score={target['score']:.4f} "
+                      f"(below hard threshold {RECOGNITION_THRESHOLD})")
+
+        # Priority 4 — centremost face regardless of score (always succeeds)
+        if target is None:
+            target = min(detected, key=lambda f: abs(f['cx'] - frame_cx) + abs(f['cy'] - frame_cy))
+            print(f"[CAPTURE_TARGETED] ⚠ Priority-4 centremost: '{target['name']}' score={target['score']:.4f} "
+                  f"— add more dataset photos for '{person_name}' and re-generate embeddings")
+
+        # When the model is confident, use the dataset name; else use VEDA-collected name
+        effective_name = person_name
+        if target['score'] >= RECOGNITION_THRESHOLD and target['name'] != 'Unknown':
+            effective_name = target['name']
 
         # ── Full-body crop around target only ────────────────────────────────
         x1, y1, x2, y2 = target['bbox']
@@ -1986,20 +2094,21 @@ def capture_targeted():
 
         # ── Save snapshot ────────────────────────────────────────────────────
         ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
-        safe     = (person_name or target['name']).replace(' ', '_')
+        safe     = effective_name.replace(' ', '_')
         filename = f"auto_{safe}_{ts}.jpg"
         filepath = os.path.join(SNAPSHOTS_PATH, filename)
         cv2.imwrite(filepath, crop, [cv2.IMWRITE_JPEG_QUALITY, 92])
-        print(f"[CAPTURE_TARGETED] Saved: {filename}")
+        print(f"[CAPTURE_TARGETED] Saved {filename}  effective={effective_name!r}  score={target['score']:.4f}")
 
-        pos_desc = f"Detected: {target['name']}"
-        if target['name'].lower() != (person_name or '').lower():
-            pos_desc += f" (requested: {person_name})"
+        pos_desc = f"Detected: {target['name']} (score={target['score']:.2f})"
+        if target['name'].lower() != effective_name.lower():
+            pos_desc += f" — labelled as: {effective_name}"
 
         snap = {
-            'filename':      filename,
-            'person_name':   person_name or target['name'],
-            'position_desc': pos_desc,
+            'filename':          filename,
+            'person_name':       effective_name,
+            'position_desc':     pos_desc,
+            'recognition_score': round(target['score'], 4),
         }
 
         # Keep pending_auto_snapshot in sync so the normal poll path also works
@@ -2345,7 +2454,7 @@ class VedaSession:
                 "Hmm, didn't catch it — please tell me your first name?",
                 "Apologies, I didn't get that — what's your first name?",
             ],
-            "advance": lambda intent: intent.startswith("NAME:"),
+            "advance": lambda intent: intent.startswith("NAME:") or intent == "__KNOWN_FACE__",
             "name_fn": lambda intent: intent[5:].capitalize() if intent.startswith("NAME:") else None,
         },
         4: {
@@ -2475,6 +2584,8 @@ class VedaSession:
 
         # Classify visitor input
         intent = "YES" if step == 5 else _classify_intent(user_text)
+        if user_text == "__KNOWN_FACE__":
+            intent = "__KNOWN_FACE__"
         print(f"[VEDA] step={step} intent={intent!r} input={user_text!r}")
 
         advance = False
@@ -2491,7 +2602,10 @@ class VedaSession:
                 reply = self._CLOSE_YES if intent == "YES" else self._CLOSE_NO
             else:
                 if step == 3:
-                    confirm = f"Nice to meet you, {name_out or 'there'}!"
+                    if intent == "__KNOWN_FACE__":
+                        confirm = "" # Silent skip
+                    else:
+                        confirm = f"Nice to meet you, {name_out or 'there'}!"
                 else:
                     confirm = self._CONFIRM.get(step, "")
 

@@ -1235,11 +1235,29 @@
         <div class="info-row">
           <span>Detected:</span><strong id="p1Position">&#8212;</strong>
         </div>
-        <div class="yesno-row">
+        <!-- Yes/No buttons — hidden when collecting name -->
+        <div class="yesno-row" id="p1YesNoRow">
           <button class="btn-yes" id="p1Yes">
             &#10003; Yes &#8212; this is me
           </button>
           <button class="btn-no" id="p1No">&#10007; No &#8212; retake</button>
+        </div>
+        <!-- Name collection sub-panel — shown only for unknown visitors after they confirm -->
+        <div id="p1NameAsk" style="display:none; flex-direction:column; gap:10px; width:100%; margin-top:6px;">
+          <div class="info-row" style="gap:8px;">
+            <input
+              type="text"
+              id="p1NameInput"
+              placeholder="Type your name here…"
+              autocomplete="given-name"
+              style="flex:1; background:var(--surface); border:1px solid var(--accent); border-radius:8px; padding:10px 14px; color:var(--text); font-size:0.9rem; outline:none;"
+            />
+            <button
+              id="p1NameSubmit"
+              class="btn-yes"
+              style="flex:0 0 auto; padding:10px 18px; border-radius:8px;"
+            >&#10003; Confirm</button>
+          </div>
         </div>
       </div>
     </div>
@@ -1997,25 +2015,116 @@
       }
 
       /* ── PANEL HELPERS ── */
+      /* ── Detect clothing color for unknown visitors ── */
+      async function getClothingColor(filename) {
+        try {
+          const r = await fetch("/api/detect_clothing_color", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ filename }),
+          });
+          const d = await r.json();
+          if (d.success) return { color: d.color, garment: d.garment };
+        } catch (_) {}
+        return { color: "dark", garment: "shirt" };
+      }
+
+      /* ── Ask for the visitor's name (typed or spoken) ── */
+      async function askVisitorName() {
+        return new Promise((resolve) => {
+          // Show the name-collection sub-panel inside panel 1
+          $("p1NameAsk").style.display = "flex";
+          $("p1YesNoRow").style.display = "none";
+          $("p1NameInput").value = "";
+          $("p1NameInput").placeholder = "Type your name here…";
+          $("p1NameInput").focus();
+
+          setAwaiting(true, "🎙 Say your name or type it");
+
+          // Listen via speech recognition once
+          listenOnce(false, null, async (spoken) => {
+            if (spoken && spoken !== "__network_error__" && spoken.trim().length > 0) {
+              // Extract the first proper word as a name
+              const candidate = spoken.trim().split(/\s+/)[0];
+              const name = candidate.charAt(0).toUpperCase() + candidate.slice(1).toLowerCase();
+              $("p1NameInput").value = name;
+            }
+          });
+
+          // Submit button handler
+          function submitName() {
+            const val = $("p1NameInput").value.trim();
+            if (!val) {
+              $("p1NameInput").placeholder = "Please enter your name…";
+              $("p1NameInput").focus();
+              return;
+            }
+            const name = val.charAt(0).toUpperCase() + val.slice(1);
+            setAwaiting(false);
+            resolve(name);
+          }
+
+          $("p1NameSubmit").onclick = submitName;
+          $("p1NameInput").onkeydown = (e) => { if (e.key === "Enter") submitName(); };
+        });
+      }
+
       function p1(filename, person, pos) {
         return new Promise(async (res) => {
           $("p1Img").src = "/api/get_snapshot/" + filename;
-          $("p1Name").value = person;
+          $("p1Name").value = person === "Unknown" ? "" : person;
           $("p1Position").textContent = pos || "\u2014";
-          const q = "Is this you, " + (userName || person) + "?";
-          $("p1Question").textContent = q;
-          $("panel1Backdrop").classList.add("visible");
-          await vedaSay("Your photo has been taken. " + q);
+
+          // Reset sub-panels
+          $("p1YesNoRow").style.display = "flex";
+          $("p1NameAsk").style.display = "none";
+
+          const isUnknown = (!person || person === "Unknown" || person.toLowerCase() === "unknown");
+
+          let q;
+          if (isUnknown) {
+            // Detect clothing color to personalise the question
+            const clothing = await getClothingColor(filename);
+            const colorDesc = clothing.color + " " + clothing.garment;
+            q = "I can see someone wearing a " + colorDesc + " in the frame — is this you?";
+            $("p1Question").textContent = q;
+            $("panel1Backdrop").classList.add("visible");
+            await vedaSay(q);
+          } else {
+            q = "Is this you, " + (userName || person) + "?";
+            $("p1Question").textContent = q;
+            $("panel1Backdrop").classList.add("visible");
+            await vedaSay("Your photo has been taken. " + q);
+          }
+
           setAwaiting(true, "🎙 Say yes or no");
+
           let done = false;
-          function done1(v) {
+          async function done1(v) {
             if (!done) {
               done = true;
               setAwaiting(false);
+
+              // If "yes" AND visitor was unknown → collect their name before closing
+              if (v === "yes" && isUnknown) {
+                $("p1Question").textContent = "Perfect! Can I please know your name?";
+                await vedaSay("Perfect! Can I please know your name?");
+                const collectedName = await askVisitorName();
+                // Store in the name field so runFlow picks it up
+                $("p1Name").value = collectedName;
+                userName = collectedName;
+                toast("👋 Nice to meet you, " + collectedName + "!", "ok", 2500);
+                await vedaSay("Nice to meet you, " + collectedName + "! Let me verify this snapshot.");
+              }
+
               $("panel1Backdrop").classList.remove("visible");
+              // Reset name-ask UI for next time
+              $("p1NameAsk").style.display = "none";
+              $("p1YesNoRow").style.display = "flex";
               res(v);
             }
           }
+
           askYesNo(q).then((a) => {
             if (a && a !== "__button_wait__") done1(a === "yes" ? "yes" : "no");
           });

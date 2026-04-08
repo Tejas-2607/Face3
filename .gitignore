@@ -13,3 +13,6 @@
 # /arcface_r100.onnx
 /models/arcface_r100.onnx
 /models/w600k_r50.onnx
+/dataset1
+/embeddings1
+/FaceRecog_208042026_app1Working.zip

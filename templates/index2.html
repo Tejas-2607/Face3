@@ -1846,8 +1846,8 @@
         lastFile = null,
         _poll = null;
 
-      async function vedaMessage(userText, silent = false) {
-        if (!silent) showTyping();
+      async function vedaMessage(userText) {
+        showTyping();
         let result = null;
         try {
           const res = await fetch("/api/veda/message", {
@@ -1857,25 +1857,21 @@
           });
           result = await res.json();
         } catch (e) {
-          if (!silent) hideTyping();
+          hideTyping();
           toast("VEDA offline — check server", "err");
           return;
         }
-        if (!silent) hideTyping();
+        hideTyping();
         const reply = result.reply || "";
         const advance = result.advance || false;
         const step = result.step || demoStep;
         const name = result.name || null;
-        if (reply && !silent) addMsg(reply, "veda");
-        if (!silent) await waitUntilSilent();
+        if (reply) addMsg(reply, "veda");
+        await waitUntilSilent();
         if (advance) {
           await onStepAdvanced(step, name);
         }
-        if (
-          !silent &&
-          demoStep !== STEP.CAPTURE &&
-          demoStep !== STEP.HARDWARE
-        ) {
+        if (demoStep !== STEP.CAPTURE && demoStep !== STEP.HARDWARE) {
           const hints = {
             [STEP.GREET]: "🎙 Say hi or type",
             [STEP.CAMERA]: "🎙 Say 'Ready' when in position",
@@ -1894,7 +1890,6 @@
           setAwaiting(true, "🎙 Say 'Ready' when in position");
         } else if (completedStep === STEP.CAMERA) {
           setPhase(1);
-          setAwaiting(false);
           setStatus("Identifying...", true);
           // Silent capture attempt for known faces
           try {
@@ -1913,8 +1908,8 @@
               // Known face! Silent advance through NAME and CONFIRM steps
               userName = d.snapshot.person_name;
               lastFile = d.snapshot.filename;
-              await vedaMessage("__KNOWN_FACE__", true); // Advances to STEP 4
-              await vedaMessage("yes", true); // Advances to STEP 5
+              await vedaMessage("__KNOWN_FACE__"); // Advances to STEP 4
+              await vedaMessage("yes"); // Advances to STEP 5
               demoStep = STEP.CAPTURE;
               runFlow(d.snapshot);
               return;
@@ -2211,7 +2206,9 @@
           // ── Extra delay after TTS finishes before starting mic ────────────
           // Without this, the mic sometimes catches the tail of VEDA's own
           // voice ("…John?") and auto-answers "yes" or triggers a false match.
-          await delay(800);
+          await delay(600);
+
+          setAwaiting(true, "🎙 Say yes or no");
 
           let done = false;
           async function done1(v) {
@@ -2241,8 +2238,6 @@
               } else if (v === "yes" && !isUnknown) {
                 // Known face: Ask the extra "target person" question
                 await vedaSay(`Are you the target person for today's demo?`);
-                // Extra delay before second question mic
-                await delay(800);
                 const targetConfirm = await askYesNo(
                   "Are you the target person for today's demo?",
                 );
@@ -2270,7 +2265,6 @@
             }
           }
 
-          // Use askYesNo directly without redundant setAwaiting call
           askYesNo(q).then((a) => {
             if (a && a !== "__button_wait__") done1(a === "yes" ? "yes" : "no");
           });
