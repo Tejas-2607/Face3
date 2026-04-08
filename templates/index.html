@@ -1138,7 +1138,7 @@
     <!-- ── NAV ── -->
     <nav>
       <a href="/" style="text-decoration: none">
-        <span class="brand-logo" style="color: var(--accent); font-family: 'Orbitron', sans-serif; font-weight: 900; font-size: 1.5rem; display: flex; align-items: center;">VEDA</span>
+        <img src="/static/VedaFullLogo.png" alt="VEDA" class="brand-logo" />
       </a>
       <div class="nav-links">
         <a href="/capture" class="nav-btn">+ Add User</a>
@@ -1163,7 +1163,11 @@
             <div class="ring"></div>
           </div>
           <div class="veda-orb" id="vedaOrb">
-            <span class="center-logo" style="color: #fff; font-family: 'Orbitron', sans-serif; font-weight: 900; font-size: 3rem; z-index: 2;">V</span>
+            <img
+              src="/static/VedaIconLogo.png"
+              alt="VEDA"
+              class="center-logo"
+            />
           </div>
         </div>
 
@@ -1224,29 +1228,6 @@
         <h2>VISION AI &#8212; STEP 1 / 3</h2>
         <p class="panel-question" id="p1Question">Is this you?</p>
         <img id="p1Img" class="panel-img" src="" alt="Snapshot" />
-        <!-- Recognition confidence badge — shown for known persons -->
-        <div
-          id="p1ConfidenceBadge"
-          style="display: none; text-align: center; margin: -4px 0 6px"
-        >
-          <span
-            id="p1ConfidenceLabel"
-            style="
-              display: inline-block;
-              padding: 4px 14px;
-              border-radius: 20px;
-              font-family: &quot;Space Mono&quot;, monospace;
-              font-size: 11px;
-              font-weight: 700;
-              background: rgba(0, 255, 170, 0.12);
-              border: 1px solid rgba(0, 255, 170, 0.35);
-              color: var(--green);
-              letter-spacing: 0.5px;
-            "
-          >
-            ✓ Face match confidence: —
-          </span>
-        </div>
         <div class="info-row">
           <span>Name:</span
           ><input type="text" id="p1Name" placeholder="Confirm or edit name" />
@@ -1262,40 +1243,20 @@
           <button class="btn-no" id="p1No">&#10007; No &#8212; retake</button>
         </div>
         <!-- Name collection sub-panel — shown only for unknown visitors after they confirm -->
-        <div
-          id="p1NameAsk"
-          style="
-            display: none;
-            flex-direction: column;
-            gap: 10px;
-            width: 100%;
-            margin-top: 6px;
-          "
-        >
-          <div class="info-row" style="gap: 8px">
+        <div id="p1NameAsk" style="display:none; flex-direction:column; gap:10px; width:100%; margin-top:6px;">
+          <div class="info-row" style="gap:8px;">
             <input
               type="text"
               id="p1NameInput"
               placeholder="Type your name here…"
               autocomplete="given-name"
-              style="
-                flex: 1;
-                background: var(--surface);
-                border: 1px solid var(--accent);
-                border-radius: 8px;
-                padding: 10px 14px;
-                color: var(--text);
-                font-size: 0.9rem;
-                outline: none;
-              "
+              style="flex:1; background:var(--surface); border:1px solid var(--accent); border-radius:8px; padding:10px 14px; color:var(--text); font-size:0.9rem; outline:none;"
             />
             <button
               id="p1NameSubmit"
               class="btn-yes"
-              style="flex: 0 0 auto; padding: 10px 18px; border-radius: 8px"
-            >
-              &#10003; Confirm
-            </button>
+              style="flex:0 0 auto; padding:10px 18px; border-radius:8px;"
+            >&#10003; Confirm</button>
           </div>
         </div>
       </div>
@@ -1846,8 +1807,8 @@
         lastFile = null,
         _poll = null;
 
-      async function vedaMessage(userText, silent = false) {
-        if (!silent) showTyping();
+      async function vedaMessage(userText) {
+        showTyping();
         let result = null;
         try {
           const res = await fetch("/api/veda/message", {
@@ -1857,25 +1818,21 @@
           });
           result = await res.json();
         } catch (e) {
-          if (!silent) hideTyping();
+          hideTyping();
           toast("VEDA offline — check server", "err");
           return;
         }
-        if (!silent) hideTyping();
+        hideTyping();
         const reply = result.reply || "";
         const advance = result.advance || false;
         const step = result.step || demoStep;
         const name = result.name || null;
-        if (reply && !silent) addMsg(reply, "veda");
-        if (!silent) await waitUntilSilent();
+        if (reply) addMsg(reply, "veda");
+        await waitUntilSilent();
         if (advance) {
           await onStepAdvanced(step, name);
         }
-        if (
-          !silent &&
-          demoStep !== STEP.CAPTURE &&
-          demoStep !== STEP.HARDWARE
-        ) {
+        if (demoStep !== STEP.CAPTURE && demoStep !== STEP.HARDWARE) {
           const hints = {
             [STEP.GREET]: "🎙 Say hi or type",
             [STEP.CAMERA]: "🎙 Say 'Ready' when in position",
@@ -1894,33 +1851,6 @@
           setAwaiting(true, "🎙 Say 'Ready' when in position");
         } else if (completedStep === STEP.CAMERA) {
           setPhase(1);
-          setAwaiting(false);
-          setStatus("Identifying...", true);
-          // Silent capture attempt for known faces
-          try {
-            const res = await fetch("/api/capture_targeted", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ person_name: "" }), // Centremost face
-            });
-            const d = await res.json();
-            if (
-              d.success &&
-              d.snapshot &&
-              d.snapshot.person_name &&
-              d.snapshot.person_name !== "Unknown"
-            ) {
-              // Known face! Silent advance through NAME and CONFIRM steps
-              userName = d.snapshot.person_name;
-              lastFile = d.snapshot.filename;
-              await vedaMessage("__KNOWN_FACE__", true); // Advances to STEP 4
-              await vedaMessage("yes", true); // Advances to STEP 5
-              demoStep = STEP.CAPTURE;
-              runFlow(d.snapshot);
-              return;
-            }
-          } catch (_) {}
-          // Fallback to normal flow if unknown or error
           setAwaiting(true, "🎙 Tell me your name");
         } else if (completedStep === STEP.NAME) {
           if (name) {
@@ -2113,16 +2043,10 @@
 
           // Listen via speech recognition once
           listenOnce(false, null, async (spoken) => {
-            if (
-              spoken &&
-              spoken !== "__network_error__" &&
-              spoken.trim().length > 0
-            ) {
+            if (spoken && spoken !== "__network_error__" && spoken.trim().length > 0) {
               // Extract the first proper word as a name
               const candidate = spoken.trim().split(/\s+/)[0];
-              const name =
-                candidate.charAt(0).toUpperCase() +
-                candidate.slice(1).toLowerCase();
+              const name = candidate.charAt(0).toUpperCase() + candidate.slice(1).toLowerCase();
               $("p1NameInput").value = name;
             }
           });
@@ -2141,13 +2065,11 @@
           }
 
           $("p1NameSubmit").onclick = submitName;
-          $("p1NameInput").onkeydown = (e) => {
-            if (e.key === "Enter") submitName();
-          };
+          $("p1NameInput").onkeydown = (e) => { if (e.key === "Enter") submitName(); };
         });
       }
 
-      function p1(filename, person, pos, recognitionScore) {
+      function p1(filename, person, pos) {
         return new Promise(async (res) => {
           $("p1Img").src = "/api/get_snapshot/" + filename;
           $("p1Name").value = person === "Unknown" ? "" : person;
@@ -2157,61 +2079,25 @@
           $("p1YesNoRow").style.display = "flex";
           $("p1NameAsk").style.display = "none";
 
-          // ── Show recognition confidence badge for known persons ────────────
-          const badge = $("p1ConfidenceBadge");
-          const badgeLabel = $("p1ConfidenceLabel");
-          const isUnknown =
-            !person ||
-            person === "Unknown" ||
-            person.toLowerCase() === "unknown";
-
-          if (!isUnknown && recognitionScore != null) {
-            const pct = Math.round(recognitionScore * 100);
-            let color = "var(--green)";
-            let bg = "rgba(0,255,170,0.12)";
-            let border = "rgba(0,255,170,0.35)";
-            if (pct < 50) {
-              color = "var(--amber)";
-              bg = "rgba(255,170,0,0.12)";
-              border = "rgba(255,170,0,0.35)";
-            }
-            if (pct < 35) {
-              color = "var(--red)";
-              bg = "rgba(255,68,102,0.12)";
-              border = "rgba(255,68,102,0.35)";
-            }
-            badgeLabel.textContent = `✓ Face match confidence: ${pct}%`;
-            badgeLabel.style.color = color;
-            badgeLabel.style.background = bg;
-            badgeLabel.style.borderColor = border;
-            badge.style.display = "block";
-          } else {
-            badge.style.display = "none";
-          }
+          const isUnknown = (!person || person === "Unknown" || person.toLowerCase() === "unknown");
 
           let q;
           if (isUnknown) {
             // Detect clothing color to personalise the question
             const clothing = await getClothingColor(filename);
             const colorDesc = clothing.color + " " + clothing.garment;
-            q =
-              "I can see someone wearing a " +
-              colorDesc +
-              " in the frame — is this you?";
+            q = "I can see someone wearing a " + colorDesc + " in the frame — is this you?";
             $("p1Question").textContent = q;
             $("panel1Backdrop").classList.add("visible");
             await vedaSay(q);
           } else {
-            q = `I recognize someone, is the ${person.toLowerCase()} I am seeing in the frame?`;
+            q = "Is this you, " + (userName || person) + "?";
             $("p1Question").textContent = q;
             $("panel1Backdrop").classList.add("visible");
-            await vedaSay(q);
+            await vedaSay("Your photo has been taken. " + q);
           }
 
-          // ── Extra delay after TTS finishes before starting mic ────────────
-          // Without this, the mic sometimes catches the tail of VEDA's own
-          // voice ("…John?") and auto-answers "yes" or triggers a false match.
-          await delay(800);
+          setAwaiting(true, "🎙 Say yes or no");
 
           let done = false;
           async function done1(v) {
@@ -2221,45 +2107,14 @@
 
               // If "yes" AND visitor was unknown → collect their name before closing
               if (v === "yes" && isUnknown) {
-                $("p1Question").textContent =
-                  "Perfect! Can I please know your name?";
+                $("p1Question").textContent = "Perfect! Can I please know your name?";
                 await vedaSay("Perfect! Can I please know your name?");
                 const collectedName = await askVisitorName();
                 // Store in the name field so runFlow picks it up
                 $("p1Name").value = collectedName;
                 userName = collectedName;
-                toast(
-                  "👋 Nice to meet you, " + collectedName + "!",
-                  "ok",
-                  2500,
-                );
-                await vedaSay(
-                  "Nice to meet you, " +
-                    collectedName +
-                    "! Let me verify this snapshot.",
-                );
-              } else if (v === "yes" && !isUnknown) {
-                // Known face: Ask the extra "target person" question
-                await vedaSay(`Are you the target person for today's demo?`);
-                // Extra delay before second question mic
-                await delay(800);
-                const targetConfirm = await askYesNo(
-                  "Are you the target person for today's demo?",
-                );
-                if (targetConfirm === "yes") {
-                  await vedaSay(`Hello ${person}, nice to see you!`);
-                  $("panel1Backdrop").classList.remove("visible");
-                  res("yes");
-                  return;
-                } else {
-                  await vedaSay(
-                    "Please bring the target person closer to the camera than you are.",
-                  );
-                  toast("Bring target person closer", "info", 4000);
-                  $("panel1Backdrop").classList.remove("visible");
-                  res("no");
-                  return;
-                }
+                toast("👋 Nice to meet you, " + collectedName + "!", "ok", 2500);
+                await vedaSay("Nice to meet you, " + collectedName + "! Let me verify this snapshot.");
               }
 
               $("panel1Backdrop").classList.remove("visible");
@@ -2270,7 +2125,6 @@
             }
           }
 
-          // Use askYesNo directly without redundant setAwaiting call
           askYesNo(q).then((a) => {
             if (a && a !== "__button_wait__") done1(a === "yes" ? "yes" : "no");
           });
@@ -2488,11 +2342,9 @@
         }
         let file = snap.filename,
           person = snap.person_name || userName || "Unknown",
-          pos = snap.position_desc || "",
-          recScore =
-            snap.recognition_score != null ? snap.recognition_score : null;
+          pos = snap.position_desc || "";
         while (true) {
-          const a = await p1(file, person, pos, recScore);
+          const a = await p1(file, person, pos);
           if (a === "yes") {
             person = $("p1Name").value.trim() || person;
             break;
@@ -2507,7 +2359,6 @@
           file = f.filename;
           person = f.person_name || userName || "Unknown";
           pos = f.position_desc || "";
-          recScore = f.recognition_score != null ? f.recognition_score : null;
         }
         while (true) {
           const a = await p2(file, person);
